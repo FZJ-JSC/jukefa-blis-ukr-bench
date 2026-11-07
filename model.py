@@ -1196,6 +1196,19 @@ def _fmt_bytes(n : float) -> str:
     return f"{n/1024**2:.1f}M"
 
 
+def _fmt_count(n : float) -> str:
+    """
+    :param n: a count -- of events, cycles, uops or their occupancy integrals
+    :return: it with the largest decimal unit that keeps it short: 768, 4.52K,
+             1.562G.  A small run then does not read as 0.000 G
+    """
+    for unit, scale in (('T', 1e12), ('G', 1e9), ('M', 1e6), ('K', 1e3)):
+        # 0.99995: the top of a decade would round to '1000' of that unit
+        if abs(n) >= scale * 0.99995:
+            return f"{n/scale:.4g}{unit}"
+    return f"{n:.4g}"
+
+
 # two roofline terms within this fraction of each other are reported as tied
 TIE = 0.005
 
@@ -2765,7 +2778,7 @@ def report_counters(an : analysis, vl : int=64):
     print(f"{'event':>24}{'total':>12}{'per k-step':>13}{'per ukr call':>14}")
     print('-' * 63)
     for k, v in pm.events.items():
-        print(f"{k:>24}{v/1e9:>10.3f} G{v/pm.ksteps:>13.2f}"
+        print(f"{k:>24}{_fmt_count(v):>12}{v/pm.ksteps:>13.2f}"
               f"{v/pm.calls:>14.1f}")
     other = [bd.level.name for bd in an.boundaries[:-1]
              if not _core_cache(bd.level.name)]
