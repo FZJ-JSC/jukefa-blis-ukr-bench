@@ -120,3 +120,17 @@ endif()
 if(AOCL_MATCH)
     target_compile_definitions(goto_bench PRIVATE AOCL_BLIS)
 endif()
+
+# --- MOMMS composition harness ---
+# A nest composed from rungs (any member of the MOMMS family), packed by
+# BLIS's packm kernel and run by BLIS's micro-kernel: the hand-written GOTO
+# nest's numbers, from data.  Single-threaded, no counters of its own.
+add_executable(momms_bench momms_bench.cpp)
+target_include_directories(momms_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
+target_link_libraries(momms_bench PRIVATE ${BLIS_LIBRARY} ${EXTRA_LIBS} OpenMP::OpenMP_CXX)
+if(EXTRA_CFLAGS)
+    target_compile_options(momms_bench PRIVATE ${EXTRA_CFLAGS})
+endif()
+if(AOCL_MATCH)
+    target_compile_definitions(momms_bench PRIVATE AOCL_BLIS)
+endif()

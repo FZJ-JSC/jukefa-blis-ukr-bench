@@ -284,6 +284,19 @@ public:
         return worst;
     }
 
+    /// A hash of C, for comparing this nest with another harness bit for bit.
+    std::uint64_t checksum() const
+    {
+        const std::uint64_t* p = reinterpret_cast<const std::uint64_t*>(C);
+        std::uint64_t h = 1469598103934665603ull;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(c_.m) * c_.n; i++)
+        {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
 private:
     // The library's GEMM on the region, into c (laid out as C).  A and B are
     // column-major; CBLAS wants one order for all three, so a row-major C
