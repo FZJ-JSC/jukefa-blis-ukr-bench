@@ -1,0 +1,6 @@
+builds
+calibrations
+patches
+events
+.ccls*
+__pycache__
