@@ -49,6 +49,7 @@ struct options
     long warmup = 2;
     long inner = 0;
     bool verify = false;
+    bool sum = false;
     bool verify_lib = false;
     int cpu = -1;
     std::string label;
@@ -96,6 +97,8 @@ timing
 
 checking
   --verify            check the region against a plain triple loop, then exit
+  --sum               print a hash of C after one region run, to compare
+                      harnesses bit for bit
   --verify-lib        check it against the linked library's cblas_dgemm, or
                       its bli_dgemm if it has no CBLAS layer, then exit; fast
                       enough for full-size problems.  Both may be given.
@@ -267,6 +270,7 @@ options parse(int argc, char** argv)
         else if (a == "--warmup") { need(i, 1); o.warmup = std::stol(argv[++i]); }
         else if (a == "--inner") { need(i, 1); o.inner = std::stol(argv[++i]); }
         else if (a == "--verify") o.verify = true;
+        else if (a == "--sum") o.sum = true;
         else if (a == "--verify-lib") o.verify_lib = true;
         else if (a == "--cpu") { need(i, 1); o.cpu = std::stoi(argv[++i]); }
         else if (a == "--hugepages") o.cfg.hugepages = true;
@@ -339,6 +343,13 @@ int main(int argc, char** argv)
     goto_nest* nest = nullptr;
     try { nest = new goto_nest(ker, o.cfg); }
     catch (const std::exception& e) { usage(argv[0], e.what()); }
+
+    if (o.sum)
+    {
+        nest->run();
+        std::printf("# sum: %016llx\n",
+                    static_cast<unsigned long long>(nest->checksum()));
+    }
 
     if (o.verify || o.verify_lib)
     {
