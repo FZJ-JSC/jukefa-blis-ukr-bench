@@ -21,6 +21,21 @@ whole: the micro-kernel always computes a full m_r x n_r tile, so a block that
 is not a multiple of m_r or n_r rounds up to whole tiles, block by block --
 though C is read and written only where it is real.
 
+Goto's is one nest of the MOMMS family (Smith and van de Geijn, SC19): any
+sequence of loops over m, n and k, ending in the two register loops around
+the micro-kernel, with A and B each packed in one of them (--nest, --pack-at,
+loop_spec).  The rule above holds for every loop -- an m-loop keeps B
+invariant, an n-loop A, a k-loop C -- and every operand's footprint is its
+extent inside one iteration of the loop, so the ladder, the traffic and all
+that follows are worked out the same way for any nest; a dimension may be cut
+more than once, e.g. k by 768 and then by 192.  Each level's pair of loops
+makes resident the block of the operand it cuts in both dimensions, which
+names the nest: Goto's is A2C0, A_c in L2 and the C tile in the registers,
+and the paper's B3A2C0 adds a 768x768 block of B in L3 (momms_name).  The
+report sets each level's traffic against the I/O lower bound of Smith,
+Lowery, Langou and van de Geijn: reading 2mnk/sqrt(M) elements into fast
+memory of M (io_bound).
+
 Traffic crossing a boundary is worked out per operand.  A rung's reuse applies
 only to the operand it keeps invariant: each operand's core-side traffic is
 divided by the product of the reuse factors of its own rungs held strictly
@@ -178,6 +193,7 @@ Usage:
                      "1M::8:48/24:1.0:16/8:20" "INF:::8/4:::150"
     python3 model.py --sw-prefetch ir:C:L2:keep k:A:L1:strm:4
     python3 model.py --rob 320 --load-queue 88   # out-of-order core's window
+    python3 model.py --mr 4 --nr 12 --nest "n:768 k:768 | m:120 k:192 | n:nr m:mr"
     python3 model.py --pack scalar         # naive strided packing
     python3 model.py --cache generic --sweep kc
     python3 model.py --counters            # predicted PMU counts
@@ -187,6 +203,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import argparse
 import math
+import re
 
 
 # ---------------------------------------------------------------- inputs ---
@@ -389,7 +406,9 @@ class sw_prefetch:
     epilogue; A and B are read progressively, so later lines are also needed
     later and a burst can keep pace.
 
-    :param loop: loop it is issued in: 'k', 'ir', 'jr', 'ic', 'pc' or 'jc'
+    :param loop: loop it is issued in: 'k', the micro-kernel's k-loop, or a
+                 label of the nest -- 'ir', 'jr', 'ic', 'pc' or 'jc' in
+                 Goto's'
     :param operand: 'A', 'B' or 'C'; must change across `loop`
     :param target: name of the level it fills into, e.g. 'L1', 'L2'
     :param hint: insertion policy at the target: 'keep' (MRU, the normal
@@ -463,11 +482,17 @@ class packing:
 @dataclass
 class blocking:
     """
-    Blocksizes that aren't microkernel sizes
+    Blocksizes that aren't microkernel sizes -- Goto's nest; any other member
+    of the MOMMS family is a loop_spec
     """
     k_c: int
     m_c: int
     n_c: int
+
+    def spec(self, m_r : int, n_r : int) -> 'loop_spec':
+        """:return: Goto's nest with these blocks, n:n_c k:k_c m:m_c n:n_r m:m_r"""
+        return make_spec([('n', self.n_c), ('k', self.k_c), ('m', self.m_c),
+                          ('n', n_r), ('m', m_r)], m_r, n_r)
 
 
 @dataclass
@@ -483,7 +508,8 @@ class problem:
 @dataclass
 class goto_rung:
     """
-    Rungs modeling the loops of a GOTO-style BLAS implementation
+    A loop of the nest, as a rung of the reuse ladder: the operand it keeps
+    invariant, and what every operand touches in one iteration of it
 
     :param loop: name of the loop
     :param operand: which block it operates on: 'A', 'B' or 'C'
@@ -528,35 +554,259 @@ class goto_rung:
         return need
 
 
+# the dimensions each operand spans, and the operand a loop over each
+# dimension leaves invariant: an m-loop keeps B, an n-loop A, a k-loop C
+DIMS = {'A': ('m', 'k'), 'B': ('k', 'n'), 'C': ('m', 'n')}
+INVARIANT = {'m': 'B', 'n': 'A', 'k': 'C'}
+
+
+@dataclass
+class nest_loop:
+    """
+    One loop of a GEMM loop nest: it partitions dimension `dim` -- 'm', 'n'
+    or 'k' -- into blocks of `block`.
+
+    :param dim: the dimension it partitions
+    :param block: the block asked for; m_r and n_r for the two register loops
+    :param label: its name in prefetch specs and reports: jc, pc, ic in
+                  Goto's nest, else the dimension and its count among the
+                  cache loops (n1, k1, m1, k2, ...); the register loops are
+                  always jr (n) and ir (m)
+    """
+    dim: str
+    block: int
+    label: str
+
+
+@dataclass
+class loop_spec:
+    """
+    A GEMM loop nest of the MOMMS family (Smith and van de Geijn, SC19),
+    outer to inner: loops over cache blocks, then the two register loops
+    around the micro-kernel, whose k is the innermost k block.  Goto's
+    algorithm is n:n_c k:k_c m:m_c n:n_r m:m_r, with A packed in ic and B in
+    pc; B3A2C0 on the paper's i7-7700K is n:768 k:768 m:120 k:192 n:12 m:4.
+
+    :param loops: outer to inner; the last two partition m and n by m_r and
+                  n_r, in either order
+    :param pack: operand -> label of the loop it is packed in, once per
+                 iteration -- the packed block is then what the loop just
+                 inside keeps invariant -- or 'pre', once before the nest
+    :param groups: the labels of each level's loops, outer to inner: a
+                   group's two dimensions make the block resident at its
+                   level, which names the algorithm (momms_name)
+    """
+    loops: list[nest_loop]
+    pack: dict[str, str]
+    groups: list[list[str]]
+
+    def labels(self) -> list[str]:
+        """:return: the loops' labels, outer to inner"""
+        return [lp.label for lp in self.loops]
+
+    def packed_loop(self, op : str) -> str:
+        """
+        :param op: 'A' or 'B'
+        :return: the label of the loop whose invariant is op's packed block
+        """
+        at = self.pack[op]
+        if at == 'pre':
+            return self.loops[0].label
+        return self.loops[self.labels().index(at) + 1].label
+
+    def is_goto(self) -> bool:
+        """:return: whether these are Goto's five loops, jc pc ic jr ir"""
+        return self.labels() == ['jc', 'pc', 'ic', 'jr', 'ir']
+
+    def text(self) -> str:
+        """:return: the nest as --nest takes it, register loops as mr/nr"""
+        out = []
+        for i, g in enumerate(self.groups):
+            if i:
+                out.append('|')
+            for lab in g:
+                lp = self.loops[self.labels().index(lab)]
+                reg = lab in ('jr', 'ir')
+                out.append(f"{lp.dim}:{lp.dim + 'r' if reg else lp.block}")
+        return ' '.join(out)
+
+
+def _default_pack(loops : list[nest_loop]) -> dict[str, str]:
+    """
+    Where A and B are packed by default: once per iteration of the loop
+    around the first loop below the top that keeps them invariant -- the
+    first time each becomes a resident or guest block below the whole
+    matrix, as MOMMS packs.  For Goto's nest that is A in ic and B in pc.
+    """
+    out = {}
+    for op in ('A', 'B'):
+        below = [i for i in range(1, len(loops)) if INVARIANT[loops[i].dim] == op]
+        out[op] = loops[below[0] - 1].label if below else 'pre'
+    return out
+
+
+def make_spec(loops : list[tuple[str, int]], m_r : int, n_r : int,
+              pack : dict[str, str]=None,
+              groups : list[list[int]]=None) -> loop_spec:
+    """
+    Build a nest from (dimension, block) pairs, outer to inner, the last two
+    the register loops: label the loops, check the packing, group the loops.
+
+    :param loops: outer to inner; the last two must be m by m_r and n by n_r
+    :param m_r: the micro-kernel's m_r
+    :param n_r: the micro-kernel's n_r
+    :param pack: operand -> loop label or 'pre'; missing: _default_pack
+    :param groups: loop indices per level; None pairs the cache loops from
+                   the inside out, the register loops being the last group
+    :return: the nest
+    :raises ValueError: on a malformed nest or packing
+    """
+    if len(loops) < 2 or sorted((d, b) for d, b in loops[-2:]) != [('m', m_r), ('n', n_r)]:
+        raise ValueError(f"the nest must end in the register loops, m:{m_r} and "
+                         f"n:{n_r} in either order (m:mr n:nr)")
+    for d, b in loops:
+        if d not in ('m', 'n', 'k'):
+            raise ValueError(f"loop over {d!r}: the dimensions are m, n and k")
+        if b < 1:
+            raise ValueError(f"loop {d}:{b}: a block is at least 1")
+    cache = [d for d, _ in loops[:-2]]
+    seen = {}
+    labels = []
+    for d in cache:
+        seen[d] = seen.get(d, 0) + 1
+        labels.append(f"{d}{seen[d]}")
+    if cache == ['n', 'k', 'm']:
+        labels = ['jc', 'pc', 'ic']
+    labels += ['jr' if d == 'n' else 'ir' for d, _ in loops[-2:]]
+    out = [nest_loop(d, b, lab) for (d, b), lab in zip(loops, labels)]
+    full = _default_pack(out)
+    for op, at in (pack or {}).items():
+        if op not in ('A', 'B'):
+            raise ValueError(f"packing {op}: only A and B are packed")
+        if at != 'pre' and at not in labels:
+            raise ValueError(f"packing {op} in {at!r}: the loops are {' '.join(labels)}")
+        full[op] = at
+    for op, at in full.items():
+        inner = out[0] if at == 'pre' else out[labels.index(at) + 1] \
+            if labels.index(at) + 1 < len(out) else None
+        if inner is None or INVARIANT[inner.dim] != op:
+            raise ValueError(f"packing {op} in {at}: the loop inside it must keep "
+                             f"{op} invariant, so that the packed block is reused")
+    if groups is None:
+        n = len(loops) - 2
+        groups = [list(range(n - 2 * (j + 1), n - 2 * j)) for j in range(n // 2)][::-1]
+        if n % 2:
+            groups.insert(0, [0])
+        groups.append([n, n + 1])
+    covered = sorted(i for g in groups for i in g)
+    if covered != list(range(len(loops))) or groups[-1] != [len(loops) - 2, len(loops) - 1]:
+        raise ValueError("the groups must take every loop once, outer to inner, the "
+                         "register loops last")
+    return loop_spec(out, full, [[labels[i] for i in g] for g in groups])
+
+
+def parse_nest(text : str, m_r : int, n_r : int, pack : str='') -> loop_spec:
+    """
+    Parse --nest: loops outer to inner as dim:block, the register loops as
+    m:mr and n:nr; a cache block may also be a multiple of the tile, 4mr or
+    80nr.  '|' between loops groups them into levels for the MOMMS name.
+        n:1920 k:256 m:96 n:nr m:mr              Goto, A2C0
+        n:768 k:768 | m:120 k:192 | n:nr m:mr    B3A2C0
+    :param text: the nest
+    :param m_r: the micro-kernel's m_r
+    :param n_r: the micro-kernel's n_r
+    :param pack: 'A:LABEL,B:LABEL' (or pre); empty: the default
+    :return: the nest
+    :raises ValueError: on a malformed nest or packing
+    """
+    toks = text.replace(',', ' ').replace('|', ' | ').split()
+    loops, groups, cur = [], [], []
+    for tok in toks:
+        if tok == '|':
+            if cur:
+                groups.append(cur)
+            cur = []
+            continue
+        d, _, blk = tok.partition(':')
+        d, blk = d.strip().lower(), blk.strip().lower()
+        m = re.fullmatch(r'(\d*)\s*(mr|nr)?', blk)
+        if not blk or not m or not (m.group(1) or m.group(2)):
+            raise ValueError(f"loop {tok!r}: give dim:block, e.g. k:256, m:4mr or n:nr")
+        num = int(m.group(1)) if m.group(1) else 1
+        unit = {'mr': m_r, 'nr': n_r}.get(m.group(2), 1)
+        cur.append(len(loops))
+        loops.append((d, num * unit))
+    if cur:
+        groups.append(cur)
+    packs = {}
+    for kv in filter(None, (x.strip() for x in pack.split(','))):
+        op, _, at = kv.partition(':')
+        packs[op.strip().upper()] = at.strip().lower() if at.strip().lower() == 'pre' \
+            else at.strip()
+    return make_spec(loops, m_r, n_r, packs, groups if len(groups) > 1 else None)
+
+
 @dataclass
 class loop_nest:
     """
-    The loops a blocking actually runs on one problem.
-
-    A block can be no larger than its dimension, and a dimension that is not
-    a multiple of its block leaves a partial last block, so each cache-block
-    loop runs ceil(dim / block) times.  Counting dim / block instead is wrong
-    at both ends: a block wider than the problem gives fewer than one pass
-    over a matrix, and a block just short of it hides a whole extra pass.
-
-    Footprints need the largest block, because that is what has to fit;
-    per-iteration averages need the mean realised block, dim / trips.
+    The loops a nest actually runs on one problem.
+    A block can be no larger than what it partitions, and one that does not
+    divide it leaves a partial last block: each dimension is cut into
+    segments, loop by loop, a partial one included -- and the micro-kernel
+    always computes a whole m_r x n_r tile, so a partial tile is a whole
+    call.  Counting dim / block instead is wrong at both ends: a block wider
+    than the problem gives fewer than one pass over a matrix, and a block
+    just short of it hides a whole extra pass.  Footprints need the largest
+    block, because that is what has to fit; per-iteration averages need the
+    mean, the dimension over the segment count.
 
     :param sizes: the problem
-    :param k_c: largest k block, min(k_c, k)
-    :param m_c: largest m block, min(m_c, m)
-    :param n_c: largest n block, min(n_c, n)
-    :param n_pc: pc trips, ceil(k / k_c)
-    :param n_ic: ic trips, ceil(m / m_c)
-    :param n_jc: jc trips, ceil(n / n_c)
+    :param spec: the nest
+    :param count: per loop, outer to inner: segments of each dimension once
+                  that loop has cut it -- over the whole problem
+    :param largest: per loop: the largest segment of each dimension inside
+                    one of its iterations
     """
     sizes: problem
-    k_c: int
-    m_c: int
-    n_c: int
-    n_pc: int
-    n_ic: int
-    n_jc: int
+    spec: loop_spec
+    count: list[dict[str, int]]
+    largest: list[dict[str, int]]
+
+    def index(self, label : str) -> int:
+        """:return: the position of a loop, outer to inner"""
+        return self.spec.labels().index(label)
+
+    def iterations(self, label : str) -> int:
+        """:return: iterations of a loop over the whole problem"""
+        c = self.count[self.index(label)]
+        return c['m'] * c['n'] * c['k']
+
+    def reuse(self, label : str) -> float:
+        """:return: iterations of a loop per iteration of the loops around it"""
+        i = self.index(label)
+        d = self.spec.loops[i].dim
+        return self.count[i][d] / (self.count[i - 1][d] if i else 1)
+
+    def extent(self, label : str, op : str) -> int:
+        """:return: elements of op inside one iteration of a loop"""
+        e = self.largest[self.index(label)]
+        return e[DIMS[op][0]] * e[DIMS[op][1]]
+
+    @property
+    def calls(self) -> int:
+        """:return: micro-kernel calls over the whole problem, whole tiles each"""
+        c = self.count[-1]
+        return c['m'] * c['n'] * c['k']
+
+    @property
+    def n_pc(self) -> int:
+        """:return: k blocks the micro-kernel sees: calls per C tile"""
+        return self.count[-1]['k']
+
+    @property
+    def k_c(self) -> int:
+        """:return: the largest k a micro-kernel call does"""
+        return self.largest[-1]['k']
 
     @property
     def k_mean(self) -> float:
@@ -564,6 +814,33 @@ class loop_nest:
         :return: mean k block -- what one micro-kernel call does on average
         """
         return self.sizes.k / self.n_pc
+
+    def _cache(self, dim : str) -> tuple[int, int]:
+        """the innermost cache loop over dim: (its largest block, its segments)"""
+        idx = [i for i, lp in enumerate(self.spec.loops[:-2]) if lp.dim == dim]
+        if not idx:
+            return getattr(self.sizes, dim), 1
+        return self.largest[idx[-1]][dim], self.count[idx[-1]][dim]
+
+    @property
+    def m_c(self) -> int:
+        """:return: largest m block of the innermost cache loop over m"""
+        return self._cache('m')[0]
+
+    @property
+    def n_c(self) -> int:
+        """:return: largest n block of the innermost cache loop over n"""
+        return self._cache('n')[0]
+
+    @property
+    def n_ic(self) -> int:
+        """:return: m blocks of the innermost cache loop over m (Goto's ic trips)"""
+        return self._cache('m')[1]
+
+    @property
+    def n_jc(self) -> int:
+        """:return: n blocks of the innermost cache loop over n (Goto's jc trips)"""
+        return self._cache('n')[1]
 
     @property
     def m_mean(self) -> float:
@@ -799,7 +1076,7 @@ class analysis:
         """
         :return: the loops this configuration's blocking runs on its problem
         """
-        return make_loop_nest(self.blocks, self.sizes)
+        return make_loop_nest(self.blocks, self.sizes, self.kernel)
 
     @property
     def t_ideal(self) -> float:
@@ -998,7 +1275,7 @@ def stream_shape(u : ukernel, b : blocking, p : problem, line : int,
                      - cm: C is column-major
     :return: one stream per operand
     """
-    k_c = make_loop_nest(b, p).k_c
+    k_c = make_loop_nest(b, p, u).k_c
     out = [stream('A', 1, k_c * u.m_r * u.size('A') / line),
            stream('B', 1, k_c * u.n_r * u.size('B') / line)]
     if c_layout == 'rm':
@@ -1030,96 +1307,137 @@ def coverage(shape : list[stream], pf : hw_prefetcher) -> dict[str,float]:
 
 # ----------------------------------------------------------------- model ---
 
-def tiles(t : loop_nest, m_r : int, n_r : int) -> tuple:
+def tiles(t : loop_nest, m_r : int=0, n_r : int=0) -> tuple:
     """
     Micro-tiles over the whole problem, along m and along n.  The micro-kernel
     always computes a whole m_r x n_r tile, so a block that is not a multiple
     of the register block rounds up, block by block -- with m_c = 4 and
     m_r = 8 every call is half wasted.  Counting dim / m_r instead charges a
     partial tile as a fraction of a call.
-    :param t: the loop nest
-    :param m_r: register block rows
-    :param n_r: register block columns
+    :param t: the loop nest, whose register loops cut the tiles
     :return: (tiles along m, tiles along n)
     """
-    def along(dim, blk, trips, r):
-        last = dim - (trips - 1) * blk
-        return (trips - 1) * -(-blk // r) + -(-last // r)
-    return (along(t.sizes.m, t.m_c, t.n_ic, m_r),
-            along(t.sizes.n, t.n_c, t.n_jc, n_r))
+    return t.count[-1]['m'], t.count[-1]['n']
 
 
 def micro_calls(u : 'ukernel', t : loop_nest) -> int:
     """
     :return: micro-kernel calls over the whole problem, whole tiles each
     """
-    tm, tn = tiles(t, u.m_r, u.n_r)
-    return tm * tn * t.n_pc
+    return t.calls
 
 
-def make_loop_nest(b : blocking, p : problem) -> loop_nest:
+def as_spec(b : 'blocking | loop_spec', u : 'ukernel') -> loop_spec:
     """
-    Clamp each block to its dimension and count whole trips.
+    :param b: a blocking (Goto's nest) or a nest
+    :param u: the micro-kernel, for the register loops
+    :return: the nest
+    """
+    return b if isinstance(b, loop_spec) else b.spec(u.m_r, u.n_r)
 
-    :param b: blocksizes as requested
+
+def make_loop_nest(b : 'blocking | loop_spec', p : problem,
+                   u : 'ukernel'=None) -> loop_nest:
+    """
+    Cut each dimension loop by loop and count the segments.
+    :param b: the nest, or a blocking for Goto's (which needs u)
     :param p: problem sizes
-    :return: the loops that blocking runs on that problem
+    :param u: the micro-kernel, if b is a blocking
+    :return: the loops that nest runs on that problem
     """
-    def trips(dim, blk):
-        return -(-dim // blk)
-    return loop_nest(p, min(b.k_c, p.k), min(b.m_c, p.m), min(b.n_c, p.n),
-                     trips(p.k, b.k_c), trips(p.m, b.m_c), trips(p.n, b.n_c))
+    spec = b if isinstance(b, loop_spec) else b.spec(u.m_r, u.n_r)
+    segs = {'m': {p.m: 1}, 'n': {p.n: 1}, 'k': {p.k: 1}}
+    count, largest = [], []
+    for lp in spec.loops:
+        new = {}
+        for size, mult in segs[lp.dim].items():
+            q, r = divmod(size, lp.block)
+            if q:
+                new[lp.block] = new.get(lp.block, 0) + q * mult
+            if r:
+                new[r] = new.get(r, 0) + mult
+        segs[lp.dim] = new
+        count.append({d: sum(v.values()) for d, v in segs.items()})
+        big = {d: max(v) for d, v in segs.items()}
+        # past a register loop its dimension is a whole tile: the micro-kernel
+        # computes all m_r x n_r of it, from micro-panels padded to m_r (n_r)
+        for reg in spec.loops[-2:]:
+            if spec.loops.index(reg) <= spec.loops.index(lp):
+                big[reg.dim] = reg.block
+        largest.append(big)
+    return loop_nest(p, spec, count, largest)
 
 
-def make_goto_ladder(u : ukernel, b : blocking, p : problem) -> list[goto_rung]:
+def make_ladder(u : ukernel, b : 'blocking | loop_spec',
+                p : problem) -> list[goto_rung]:
     """
-    Creates a ladder modeling the 5 outer loops of a GOTO-style GEMM implementation
+    One rung per loop of the nest, innermost first.  A loop keeps the
+    operand it does not index invariant -- an m-loop B, an n-loop A, a
+    k-loop C -- and every operand's footprint is its extent inside one
+    iteration of the loop: the invariant's whole block, and what each
+    streaming operand touches in one iteration.  Goto's nest gives
+    ir: B_r (A_r, C_r), jr: A_c (B_r, a C strip), ic: B_c (A_c, a C block),
+    pc: a C panel (an A panel, B_c), jc: all of A (a B panel, a C panel).
+    :param u: microkernel model
+    :param b: the nest, or a blocking for Goto's
+    :param p: problem sizes
+    :return: the rungs, innermost first
+    """
+    t = make_loop_nest(b, p, u)
+    out = []
+    for i, lp in enumerate(t.spec.loops):
+        inv = INVARIANT[lp.dim]
+        e = t.largest[i]
+        fp = {op: e[DIMS[op][0]] * e[DIMS[op][1]] * u.size(op) for op in 'ABC'}
+        out.append(goto_rung(lp.label, inv, fp[inv],
+                             {op: fp[op] for op in 'ABC' if op != inv},
+                             t.reuse(lp.label)))
+    return out[::-1]
 
+
+def make_goto_ladder(u : ukernel, b : 'blocking | loop_spec',
+                     p : problem) -> list[goto_rung]:
+    """
+    The ladder of Goto's nest (or of any other: see make_ladder)
     :param u: microkernel model
     :param b: blocksizes
     :param p: problem sizes
-    :return: list of goto_rung objects for each loop
+    :return: list of goto_rung objects for each loop, innermost first
     """
-    t = make_loop_nest(b, p)
-    tm, tn = tiles(t, u.m_r, u.n_r)
-    sa, sb, sc = u.size('A'), u.size('B'), u.size('C')
-    A_r = t.k_c * u.m_r * sa
-    B_r = t.k_c * u.n_r * sb
-    C_r = u.m_r * u.n_r * sc
-    A_c = t.m_c * t.k_c * sa
-    B_c = t.k_c * t.n_c * sb
-    C_p = p.m * t.n_c * sc
-    A_f = p.m * p.k * sa
-    # what one iteration of each loop touches of the operands it streams:
-    # the jr loop's ir loop passes a whole C strip through, the ic loop's
-    # jr loop a whole C block, pc all of A's blocks, jc all of B's
-    C_s = t.m_c * u.n_r * sc
-    C_c = t.m_c * t.n_c * sc
-    A_p = p.m * t.k_c * sa
-    B_p = p.k * t.n_c * sb
-    return [
-        # calls per ir loop and jr iterations per jc block, whole tiles
-        goto_rung('ir', 'B', B_r, {'A': A_r, 'C': C_r}, tm / t.n_ic),
-        goto_rung('jr', 'A', A_c, {'B': B_r, 'C': C_s}, tn / t.n_jc),
-        goto_rung('ic', 'B', B_c, {'A': A_c, 'C': C_c}, t.n_ic),
-        goto_rung('pc', 'C', C_p, {'A': A_p, 'B': B_c}, t.n_pc),
-        goto_rung('jc', 'A', A_f, {'B': B_p, 'C': C_p}, t.n_jc),
-    ]
+    return make_ladder(u, b, p)
 
 
-def pack_work(u : ukernel, b : blocking, p : problem) -> dict[str,float]:
+def _pack_repeats(t : loop_nest, op : str) -> list[str]:
     """
-    Elements packed over the whole GEMM, per operand.
+    The loops that make an operand's packing repeat: those at or above the
+    loop it is packed in that do not index it -- every iteration of one
+    packs the same elements again.  Goto's A, packed in ic: jc.
+    :param t: the loop nest
+    :param op: 'A' or 'B'
+    :return: their labels
+    """
+    at = t.spec.pack[op]
+    top = -1 if at == 'pre' else t.index(at)
+    return [lp.label for lp in t.spec.loops[:top + 1] if lp.dim not in DIMS[op]]
 
+
+def pack_work(u : ukernel, b : 'blocking | loop_spec', p : problem) -> dict[str,float]:
+    """
+    Elements packed over the whole GEMM, per operand: each element once per
+    iteration of the loops that make its packing repeat.
     :param u: microkernel model
-    :param b: blocksizes
+    :param b: the nest, or a blocking for Goto's
     :param p: problem sizes
     :return: number of elements packed
     """
-    return {
-        'A': float(make_loop_nest(b, p).n_jc) * p.m * p.k,  # per (jc,pc,ic)
-        'B': p.k * p.n,                      # once per (jc,pc)
-    }
+    t = make_loop_nest(b, p, u)
+    out = {}
+    for op, n in (('A', p.m * p.k), ('B', p.k * p.n)):
+        mult = 1.0
+        for lab in _pack_repeats(t, op):
+            mult *= t.reuse(lab)
+        out[op] = mult * n
+    return out
 
 
 def packed_elems(u : ukernel, b : blocking, p : problem,
@@ -1153,8 +1471,8 @@ def core_traffic(u : ukernel, b : blocking, p : problem,
     :param pk: packing model
     :return: bytes moved over the whole GEMM, before any reuse
     """
-    t = make_loop_nest(b, p)
-    calls = micro_calls(u, t)
+    t = make_loop_nest(b, p, u)
+    calls = t.calls
     # every call streams whole packed micro-panels; C moves only where it is
     # real -- a partial tile is computed whole but written back in part
     c_elems = p.m * p.n * t.n_pc
@@ -1212,37 +1530,54 @@ def _fmt_count(n : float) -> str:
 # two roofline terms within this fraction of each other are reported as tied
 TIE = 0.005
 
-# The loop whose invariant is each packed block.  When that rung is held
-# inside a boundary, the packed block is resident there.
+# In Goto's nest: the loop whose invariant is each packed block -- when that
+# rung is held inside a boundary, the packed block is resident there -- the
+# loops innermost first, 'k' being the k-loop inside the ukr, and the
+# operands that change across each loop, the only ones there is anything new
+# to prefetch for (the rest is the loop's invariant; C lives in registers for
+# the whole k-loop).  Any other nest: loop_spec.packed_loop, nest_order,
+# varying_ops.
 PACKED = {'A': 'jr', 'B': 'ic'}
-
-# loops of the nest, innermost first; 'k' is the k-loop inside the ukr
 LOOPS = ('k', 'ir', 'jr', 'ic', 'pc', 'jc')
-
-# operands that change across each loop -- the only ones there is anything
-# new to prefetch for.  The rest is the loop's invariant (C lives in
-# registers for the whole k-loop).
 VARYING = {'k': {'A', 'B'}, 'ir': {'A', 'C'}, 'jr': {'B', 'C'},
            'ic': {'A', 'C'}, 'pc': {'A', 'B'}, 'jc': {'B', 'C'}}
 
 
+def nest_order(t : loop_nest) -> tuple[str, ...]:
+    """
+    :param t: the loop nest
+    :return: the loops a prefetch can be issued in, innermost first: the
+             micro-kernel's k-loop, then the nest's
+    """
+    return ('k',) + tuple(reversed(t.spec.labels()))
+
+
+def varying_ops(t : loop_nest, loop : str) -> set[str]:
+    """
+    :param t: the loop nest
+    :param loop: a label of nest_order
+    :return: the operands that change across the loop: those it indexes
+    """
+    if loop == 'k':
+        return {'A', 'B'}
+    d = t.spec.loops[t.index(loop)].dim
+    return {op for op in 'ABC' if d in DIMS[op]}
+
+
 def loop_period(an : analysis, loop : str) -> float:
     """
-    Cycles one iteration of a loop takes, at the ideal (compute-bound) rate.
-    The real loop is slower, so leads built from this are lower bounds.
+    Cycles one iteration of a loop takes, at the ideal (compute-bound) rate:
+    the micro-kernel's time over the loop's iterations.  The real loop is
+    slower, so leads built from this are lower bounds.
 
     :param an: analysis of the configuration
-    :param loop: 'k', 'ir', 'jr', 'ic', 'pc' or 'jc'
+    :param loop: 'k' (the micro-kernel's k-loop) or a loop of the nest
     :return: cycles per iteration
     """
     u, t = an.kernel, an.nest
-    tm, tn = tiles(t, u.m_r, u.n_r)
-    t_call = u.time(t.k_mean)
-    t_jr = (tm / t.n_ic) * t_call
-    t_ic = (tn / t.n_jc) * t_jr
-    t_pc = t.n_ic * t_ic
-    return {'k': 2 * u.m_r * u.n_r / u.peak, 'ir': t_call, 'jr': t_jr,
-            'ic': t_ic, 'pc': t_pc, 'jc': t.n_pc * t_pc}[loop]
+    if loop == 'k':
+        return 2 * u.m_r * u.n_r / u.peak
+    return t.calls * u.time(t.k_mean) / t.iterations(loop)
 
 
 def loop_lead(an : analysis, sp : sw_prefetch) -> float:
@@ -1282,8 +1617,9 @@ def _burst_timeliness(an : analysis, ev : prefetch_eval,
     n = max(1, int(ev.instance / level.line))
     if sp.operand == 'C':
         tile = max(1, int(u.m_r * u.n_r * u.size('C') / level.line))
+        call = loop_period(an, an.nest.spec.loops[-1].label)
         def offset(i):
-            return (i // tile) * loop_period(an, 'ir')
+            return (i // tile) * call
     else:
         per_k = (u.m_r if sp.operand == 'A' else u.n_r) * u.size(sp.operand)
         step = loop_period(an, 'k') * level.line / per_k
@@ -1334,21 +1670,19 @@ def prefetch_instance(u : ukernel, b : blocking, p : problem,
     :param c_layout: 'rm' or 'cm', for C
     :return: bytes in one prefetched instance
     """
-    t = make_loop_nest(b, p)
+    t = make_loop_nest(b, p, u)
     d = max(1, sp.distance)
-    elems = {('k', 'A'): d * u.m_r,
-             ('k', 'B'): d * u.n_r,
-             ('ir', 'A'): t.k_c * u.m_r, ('ir', 'C'): u.m_r * u.n_r,
-             ('jr', 'B'): t.k_c * u.n_r, ('jr', 'C'): t.m_c * u.n_r,
-             ('ic', 'A'): t.m_c * t.k_c, ('ic', 'C'): t.m_c * t.n_c,
-             ('pc', 'A'): p.m * t.k_c,   ('pc', 'B'): t.k_c * t.n_c,
-             ('jc', 'B'): p.k * t.n_c,   ('jc', 'C'): p.m * t.n_c,
-             }[(sp.loop, sp.operand)]
+    if sp.loop == 'k':
+        elems = d * (u.m_r if sp.operand == 'A' else u.n_r)
+    else:
+        if sp.operand not in varying_ops(t, sp.loop):
+            raise ValueError(f"{sp.operand} is invariant across {sp.loop}")
+        elems = t.extent(sp.loop, sp.operand)
     nbytes = elems * u.size(sp.operand)
-    if sp.operand == 'C' and line:
+    if sp.operand == 'C' and line and sp.loop != 'k':
         # the instance's segments: rows (row-major) or columns of it
-        seg = ({'ir': u.n_r, 'jr': u.n_r, 'ic': t.n_c, 'jc': t.n_c} if c_layout == 'rm'
-               else {'ir': u.m_r, 'jr': t.m_c, 'ic': t.m_c, 'jc': p.m})[sp.loop]
+        e = t.largest[t.index(sp.loop)]
+        seg = e['n'] if c_layout == 'rm' else e['m']
         nbytes *= _seg_factor(seg * u.size('C'), line)
     return nbytes
 
@@ -1372,15 +1706,16 @@ def evaluate_prefetch(an : analysis, sp : sw_prefetch) -> prefetch_eval:
     bds = an.boundaries
     idx = {bd.level.name: i for i, bd in enumerate(bds)}
     ev = prefetch_eval(sp)
-    if sp.loop not in LOOPS:
+    order = nest_order(an.nest)
+    if sp.loop not in order:
         ev.notes.append(f"unknown loop {sp.loop!r}; expected one of "
-                        f"{', '.join(LOOPS)}")
+                        f"{', '.join(order)}")
         return ev
     if sp.target not in idx or idx[sp.target] == len(bds) - 1:
         ev.notes.append(f"{sp.target!r} is not a cache level that can be "
                         f"prefetched into")
         return ev
-    if sp.operand not in VARYING[sp.loop]:
+    if sp.operand not in varying_ops(an.nest, sp.loop):
         ev.notes.append(f"{sp.operand} is invariant across {sp.loop}: there "
                         f"is nothing new to fetch")
         return ev
@@ -1442,7 +1777,7 @@ def evaluate_prefetch(an : analysis, sp : sw_prefetch) -> prefetch_eval:
     # enclosing loop, so the lines are there before the prefetch is issued
     for r in an.rungs:
         if (r.operand == sp.operand
-                and LOOPS.index(r.loop) > LOOPS.index(sp.loop)
+                and order.index(r.loop) > order.index(sp.loop)
                 and r.need_at(L, strm) <= L.cap):
             ev.resident = True
             ev.notes.append(f"already resident in {L.name}, as part of the "
@@ -1452,8 +1787,9 @@ def evaluate_prefetch(an : analysis, sp : sw_prefetch) -> prefetch_eval:
 
     ev.exposed = bds[t + 1].rd[sp.operand]
     if ev.exposed <= 0:
-        packed = (sp.operand in PACKED
-                  and any(r.loop == PACKED[sp.operand]
+        spec = an.nest.spec
+        packed = (sp.operand in spec.pack
+                  and any(r.loop == spec.packed_loop(sp.operand)
                           and r.need_at(L, strm) <= L.cap for r in an.rungs))
         why = (f"the packed {sp.operand}_c is resident in {L.name}, so the "
                f"micro-kernel reads no {sp.operand} from beyond it: it "
@@ -1596,20 +1932,21 @@ def _kept(an : analysis, op : str, holder : int, j : int,
 
 
 def _pack_crossing(tr : traffic, resident : set[str],
-                   a_reuse : float) -> tuple[float, float]:
+                   src_reuse : dict[str, float]) -> tuple[float, float]:
     """
     Packing traffic crossing one boundary.  Private, and unpacked on the spot.
 
     :param tr: traffic before any reuse
     :param resident: operands whose packed buffer is resident inside the
                      boundary -- their writes never cross it
-    :param a_reuse: packs of A that share one read of its source here: n_jc
-                    if the whole of A is resident inside, else 1
+    :param src_reuse: packs of each operand that share one read of its
+                      source here, from the source block staying inside
+                      across the loops that repeat its packing (Goto's A:
+                      n_jc if the whole of A is resident inside)
     :return: (read bytes, write bytes) crossing the boundary
     """
     wr = sum(v for op, v in tr.pack_wr.items() if op not in resident)
-    src = {op: v / (a_reuse if op == 'A' else 1)
-           for op, v in tr.pack_rd.items()}
+    src = {op: v / src_reuse.get(op, 1) for op, v in tr.pack_rd.items()}
     return sum(src.values()) + (wr if tr.rfo else 0.0), wr
 
 
@@ -1662,7 +1999,9 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     # the core's load queue tracks loads only; stores go through the store
     # queue, so it is a read-only holder
     core = cache_level('core', 0.0, mshr=core_mshr, shared_buf=False)
-    rungs = make_goto_ladder(u, b, p)
+    t = make_loop_nest(b, p, u)
+    spec = t.spec
+    rungs = make_ladder(u, b, p)
     tr = core_traffic(u, b, p, pk)
     # operands a 'strm' hint inserts near LRU, per level, with the ways each
     # one's window occupies -- this changes what fits, so it has to be known
@@ -1671,13 +2010,13 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     for sp in sw:
         L = next((L for L in levels if L.name == sp.target), None)
         if (sp.hint == 'strm' and L is not None and L.assoc
-                and sp.loop in LOOPS and sp.operand in VARYING[sp.loop]):
+                and sp.loop in nest_order(t)
+                and sp.operand in varying_ops(t, sp.loop)):
             ways = max(1, -(-prefetch_instance(u, b, p, sp, L.line, c_layout)
                             // L.way))
             strm[L.name][sp.operand] = max(strm[L.name].get(sp.operand, 0),
                                            int(ways))
 
-    t = make_loop_nest(b, p)
     flops = 2 * p.m * p.n * p.k + u.epi_flops * p.m * p.n * t.n_pc
     calls = micro_calls(u, t)
     w = packed_elems(u, b, p, pk)
@@ -1698,20 +2037,26 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
         # the micro-kernel, and the next block is packed over it in place: so
         # neither the micro-kernel's pass over that operand nor the buffer's
         # write-back crosses this boundary.  The pack's read of the source
-        # still does -- once per jc trip, or once in all if the whole of A is
-        # resident inside too.
+        # still does -- once for every repeat of its packing, unless the
+        # source block stays inside across the loop that repeats it (Goto's
+        # A: once per jc trip, or once in all if the whole of A is resident)
         held = {r.loop for r in inner}
-        resident = {op for op, loop in PACKED.items() if loop in held}
+        resident = {op for op in ('A', 'B') if spec.packed_loop(op) in held}
         for op in resident:
             rd[op] = 0.0
-        pk_rd, pk_wr = _pack_crossing(tr, resident,
-                                      t.n_jc if 'jc' in held else 1)
+        src_reuse = {}
+        for op in ('A', 'B'):
+            for lab in _pack_repeats(t, op):
+                if lab in held:
+                    src_reuse[op] = src_reuse.get(op, 1.0) * t.reuse(lab)
+        pk_rd, pk_wr = _pack_crossing(tr, resident, src_reuse)
         # C moves in lines, not bytes: each row of a tile (column, if C is
         # column-major) touches the lines it overlaps -- and the line it
-        # shares with the next tile along the row moves again, unless the C
-        # strip stays inside this boundary until the next jr iteration,
-        # which is what 'jr' being held means
-        if li and 'jr' not in held:
+        # shares with the next tile along the row moves again, unless the
+        # tile stays inside this boundary until the register loop along C's
+        # rows (columns) reaches that next tile: unless that loop is held
+        along = 'jr' if c_layout == 'rm' else 'ir'
+        if li and along not in held:
             fc = _seg_factor((u.n_r if c_layout == 'rm' else u.m_r) * u.size('C'),
                              req.line)
             rd['C'] = rd.get('C', 0.0) * fc
@@ -2248,9 +2593,9 @@ def parse_prefetch(tok : str) -> sw_prefetch:
     dist = int(f[4]) if len(f) > 4 and f[4] else 0
     if dist < 0:
         raise ValueError(f"prefetch {tok!r}: the distance cannot be negative")
-    if loop not in LOOPS:
-        raise ValueError(f"prefetch {tok!r}: loop must be one of "
-                         f"{', '.join(LOOPS)}")
+    if not re.fullmatch(r'[a-z]+\d*', loop):
+        raise ValueError(f"prefetch {tok!r}: loop must be k or a loop of the "
+                         f"nest, e.g. {', '.join(LOOPS)}")
     if op not in ('A', 'B', 'C'):
         raise ValueError(f"prefetch {tok!r}: operand must be A, B or C")
     if hint not in ('keep', 'strm'):
@@ -2342,16 +2687,83 @@ def _loops_line(an : analysis) -> str:
     :param an: analysis of the configuration
     :return: e.g. "jc 1 x 2000 (clamped from 4000)   pc 13 x 160, last 80"
     """
-    b, p, t = an.blocks, an.sizes, an.nest
-    out = []
-    for name, dim, want, got, trips in (('jc', p.n, b.n_c, t.n_c, t.n_jc),
-                                        ('pc', p.k, b.k_c, t.k_c, t.n_pc),
-                                        ('ic', p.m, b.m_c, t.m_c, t.n_ic)):
+    p, t = an.sizes, an.nest
+    out, cut = [], set()
+    for i, lp in enumerate(t.spec.loops[:-2]):
+        dim, got = getattr(p, lp.dim), t.largest[i][lp.dim]
+        trips = t.reuse(lp.label)
+        if lp.dim in cut:
+            # a dimension cut again: its iterations per outer block vary
+            out.append(f"{lp.label} {trips:.3g} x {got}")
+            continue
+        cut.add(lp.dim)
+        trips = int(round(trips))
         last = dim - (trips - 1) * got
-        note = (f" (clamped from {want})" if want > dim else
+        note = (f" (clamped from {lp.block})" if lp.block > dim else
                 f", last {last}" if last != got else "")
-        out.append(f"{name} {trips} x {got}{note}")
+        out.append(f"{lp.label} {trips} x {got}{note}")
     return '   '.join(out)
+
+
+def momms_name(an : analysis) -> str:
+    """
+    The nest's name in the MOMMS convention: for each group of loops, outer
+    to inner, the operand whose two dimensions they partition -- the block
+    resident at that level -- with the innermost cache level that holds it,
+    0 for the registers: B3A2C0.  A group of one loop, or of one dimension,
+    makes no resident block (Goto's jc, so Goto's nest is A2C0).  A resident
+    block no cache holds is marked ?, as is one the next loop does not keep
+    invariant -- the group's two loops then do not make it resident.
+
+    :param an: analysis of the configuration
+    :return: the name
+    """
+    spec = an.nest.spec
+    labels = spec.labels()
+    out = []
+    for gi, g in enumerate(spec.groups):
+        dims = {spec.loops[labels.index(lab)].dim for lab in g}
+        if len(dims) != 2:
+            continue
+        op = next(o for o, ds in DIMS.items() if set(ds) == dims)
+        if gi == len(spec.groups) - 1:
+            out.append(f"{op}0")
+            continue
+        after = spec.loops[labels.index(g[-1]) + 1]
+        lvl = None
+        if INVARIANT[after.dim] == op:
+            lvl = next((i + 1 for i, bd in enumerate(an.boundaries[:-1])
+                        if any(r.loop == after.label for r in bd.holds)), None)
+        out.append(f"{op}{lvl if lvl else '?'}")
+    return ''.join(out)
+
+
+def io_bound(an : analysis) -> list[dict]:
+    """
+    The I/O lower bound of Smith, Lowery, Langou and van de Geijn (arXiv
+    1702.02017), level by level, against the model.  With fast memory of M
+    elements, any ordinary GEMM reads at least 2mnk/sqrt(M) - 2M elements
+    into it and writes at least mn - M back.  M is the level's capacity,
+    plus that of the levels inside it it is exclusive of (a level marked v
+    evicts everything into the next, so the two hold disjoint lines).  With
+    operands of different sizes there is no single element count: empty.
+
+    :param an: analysis of the configuration
+    :return: per cache level: level, M, the model's rd and wr into it, and
+             the bounds rd_lb and wr_lb -- all in elements
+    """
+    u, p, bds = an.kernel, an.sizes, an.boundaries
+    if len({u.size(op) for op in 'ABC'}) > 1:
+        return []
+    s, cap, out = u.size('C'), 0.0, []
+    for i, bd in enumerate(bds[:-1]):
+        cap = (cap if i and bds[i - 1].level.victim else 0.0) + bd.level.size
+        m = cap / s
+        out.append(dict(level=bd.level.name, M=m,
+                        rd=bds[i + 1].tot_rd / s, wr=bds[i + 1].tot_wr / s,
+                        rd_lb=max(0.0, 2 * p.m * p.n * p.k / math.sqrt(m) - 2 * m),
+                        wr_lb=max(0.0, p.m * p.n - m)))
+    return out
 
 
 def _packed_notes(an : analysis) -> list[str]:
@@ -2362,7 +2774,9 @@ def _packed_notes(an : analysis) -> list[str]:
     :return: one line per packed operand
     """
     out = []
-    for op, loop in PACKED.items():
+    spec = an.nest.spec
+    for op in ('A', 'B'):
+        loop = spec.packed_loop(op)
         home = next((bd.level.name for bd in an.boundaries[:-1]
                      if any(r.loop == loop for r in bd.holds)), None)
         out.append(f"packed {op}_c is resident in {home}: beyond it the "
@@ -2520,16 +2934,24 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
           f"epi={u.epi_peak} FLOP/cy x {u.epi_flops} FLOP/elem  "
           f"C {'read+written' if u.c_read else 'write-only'}"
           f"{'' if wa else ', no write-allocate'}")
-    print(f"blocking     k_c={b.k_c} m_c={b.m_c} n_c={b.n_c}   "
-          f"problem {p.m}x{p.n}x{p.k}")
+    spec = an.nest.spec
+    if spec.is_goto():
+        nc, kc, mc = (lp.block for lp in spec.loops[:3])
+        print(f"blocking     k_c={kc} m_c={mc} n_c={nc}   "
+              f"problem {p.m}x{p.n}x{p.k}")
+    else:
+        print(f"nest         {spec.text()}   problem {p.m}x{p.n}x{p.k}")
+    print(f"MOMMS name   {momms_name(an)}   (A packed in {spec.pack['A']}, "
+          f"B in {spec.pack['B']})")
     t = an.nest
     print(f"loops        {_loops_line(an)}")
     rung = {r.loop: r for r in an.rungs}
-    ir = rung['ir']
-    print(f"A_c={rung['jr'].invariant/1024:.0f}K  "
-          f"B_c={rung['ic'].invariant/1024:.0f}K  "
-          f"B_r={ir.invariant/1024:.0f}K  A_r={ir.streamers['A']/1024:.0f}K  "
-          f"C_r={ir.streamers['C']/1024:.1f}K")
+    inner = an.rungs[0]
+    print('  '.join(f"{op}_c={rung[spec.packed_loop(op)].invariant/1024:.0f}K"
+                    for op in ('A', 'B'))
+          + f"  {inner.operand}_r={inner.invariant/1024:.0f}K  "
+          + '  '.join(f"{op}_r={v/1024:.{1 if op == 'C' else 0}f}K"
+                      for op, v in inner.streamers.items()))
     w = an.pack_elems
     print(f"packing      A {w['A']/1e6:.1f}M elem @ {pk.rate_a} elem/cy amp "
           f"{pk.amp_a}, B {w['B']/1e6:.1f}M elem @ {pk.rate_b} elem/cy amp "
@@ -2582,6 +3004,20 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
               f"   -> {prev}")
         prev = L.name
 
+    bound = io_bound(an)
+    if bound:
+        print(f"\nI/O LOWER BOUND   (Smith et al.: into M elements of fast memory, "
+              f"reads >= 2mnk/sqrt(M) - 2M, writes >= mn - M)")
+        print(f"{'into':>6}{'M elems':>10}{'reads':>10}{'bound':>9}{'x':>7}"
+              f"{'writes':>10}{'bound':>9}{'x':>7}")
+        for r in bound:
+            xr = f"{r['rd'] / r['rd_lb']:.1f}" if r['rd_lb'] else '-'
+            xw = f"{r['wr'] / r['wr_lb']:.1f}" if r['wr_lb'] else '-'
+            print(f"{r['level']:>6}{r['M']:>10.0f}{r['rd']/1e6:>9.1f}M{r['rd_lb']/1e6:>8.1f}M"
+                  f"{xr:>7}{r['wr']/1e6:>9.1f}M{r['wr_lb']/1e6:>8.1f}M{xw:>7}")
+        if any(bd.level.victim for bd in an.boundaries[:-2]):
+            print("  a level marked v evicts clean lines too, which the write bound "
+                  "does not count")
     pf = an.pf
     l0 = an.boundaries[0].level.line
     print(f"\nSTREAMS per ukr call (innermost line {l0}B, prefetcher tracks "
@@ -2818,6 +3254,10 @@ def sweep(an : analysis, var : str='kc', ac_budget : float=None):
     :param ac_budget: A_c footprint to hold, in bytes; defaults to an's
     """
     u, b = an.kernel, an.blocks
+    if isinstance(b, loop_spec):
+        if not b.is_goto():
+            raise ValueError("--sweep kc runs Goto's nest only")
+        b = blocking(b.loops[1].block, b.loops[2].block, b.loops[0].block)
     ac = ac_budget or b.m_c * b.k_c * u.size('A')
     print(f"sweeping {var}, holding A_c ~ {ac/1024:.0f} KiB   (rd / wr B/cy)\n")
     hdr = f"{'k_c':>6}{'m_c':>6}{'B_r':>7}{'pack%':>7}"
@@ -2865,7 +3305,7 @@ def selftest() -> int:
     chk("A: prod(rungs) == n/n_r", prod['A'], p.n / u.n_r)
     chk("B: prod(rungs) == m/m_r", prod['B'], p.m / u.m_r)
     chk("C: prod(rungs) == ceil(k/k_c)", prod['C'],
-        make_loop_nest(b, p).n_pc)
+        make_loop_nest(b, p, u).n_pc)
 
     print("\ncore-side traffic per k-step is fixed by the micro-kernel shape")
     lv = parse_hierarchy('32K:::-1;1M:::-1;INF:::-1')
@@ -3491,6 +3931,63 @@ def selftest() -> int:
     chk("L1D_CACHE == L1D_CACHE_RD + L1D_CACHE_WR", ev['L1D_CACHE'],
         ev['L1D_CACHE_RD'] + ev['L1D_CACHE_WR'])
 
+    print("\nthe MOMMS family: any loop nest, Goto's among them")
+    # the paper's i7-7700K: 32K L1d, 256K L2, 6M L3, BLIS's 4x12 kernel
+    hk = parse_hierarchy('32K:64:8:64/32:1.0:10:4;256K:64:4:32/32:1.0:16:8;'
+                         '6M:64:12:16/16:1.0:32:30;INF:::8:::200')
+    uk = ukernel(4, 12, 8, 16.0, 16.0, 3)
+    pk3 = packing(2.0, 2.0)
+    p3 = problem(3000, 3000, 3000)
+    g_txt = parse_nest('n:3000 k:192 m:120 n:nr m:mr', 4, 12)
+    chk("Goto's nest from --nest text: labels jc pc ic jr ir",
+        float(g_txt.labels() == ['jc', 'pc', 'ic', 'jr', 'ir']), 1.0)
+    chk("... A packed in ic, B in pc", float(g_txt.pack == {'A': 'ic', 'B': 'pc'}), 1.0)
+    chk("... the same prediction as blocking(192, 120, 3000)",
+        predict(analyse(uk, g_txt, p3, hk, pk3)).time,
+        predict(analyse(uk, blocking(192, 120, 3000), p3, hk, pk3)).time)
+    chk("... named A2C0, as the paper names Goto",
+        float(momms_name(analyse(uk, g_txt, p3, hk, pk3)) == 'A2C0'), 1.0)
+    b3 = parse_nest('n:768 k:768 | m:120 k:192 | n:nr m:mr', 4, 12)
+    chk("B3A2C0: labels n1 k1 m1 k2 jr ir",
+        float(b3.labels() == ['n1', 'k1', 'm1', 'k2', 'jr', 'ir']), 1.0)
+    chk("... B packed in k1 (the 768x768 block), A in k2 (120x192)",
+        float(b3.pack == {'B': 'k1', 'A': 'k2'}), 1.0)
+    ab3 = analyse(uk, b3, p3, hk, pk3)
+    rb3 = {r.loop: r for r in ab3.rungs}
+    chk("... m1 keeps the 768x768 B block invariant", rb3['m1'].invariant,
+        768 * 768 * 8)
+    chk("... jr the 120x192 A block", rb3['jr'].invariant, 120 * 192 * 8)
+    chk("... named B3A2C0", float(momms_name(ab3) == 'B3A2C0'), 1.0)
+    chk("... B packed once: k*n", pack_work(uk, b3, p3)['B'], 3000 * 3000)
+    chk("... A once per n1 trip: m*k*ceil(3000/768)", pack_work(uk, b3, p3)['A'],
+        3000 * 3000 * 4)
+    a3 = parse_nest('m:768 k:768 | n:120 k:192 | m:mr n:nr', 4, 12)
+    chk("A3B2C0 (register loops m outside n): named so",
+        float(momms_name(analyse(uk, a3, p3, hk, pk3)) == 'A3B2C0'), 1.0)
+    c3 = parse_nest('m:640 n:640 | k:192 m:120 | n:nr m:mr', 4, 12)
+    chk("C3A2C0: named so", float(momms_name(analyse(uk, c3, p3, hk, pk3)) == 'C3A2C0'), 1.0)
+    chk("... a 1200x1200 C block, too big for L3, is named C?",
+        float(momms_name(analyse(uk, parse_nest('m:1200 n:1200 | k:192 m:120 | n:nr m:mr',
+                                                4, 12), p3, hk, pk3)).startswith('C?')), 1.0)
+    tk = make_loop_nest(b3, problem(500, 500, 1000), uk)
+    chk("two k-loops: k 1000 by 768 then 192 = 768+232 -> 4x192 + 192 + 40: 6 calls a tile",
+        tk.n_pc, 6)
+    chk("... the micro-kernel's k at most 192", tk.k_c, 192)
+    chk("... 1000/6 on average", tk.k_mean, 1000 / 6)
+    lb = io_bound(analyse(uk, blocking(192, 120, 3000), problem(1000, 1000, 1000),
+                          parse_hierarchy('32K:64:8;INF:::8'), pk3))
+    chk("I/O bound into a 32K level of doubles: 2mnk/sqrt(4096) - 2*4096",
+        lb[0]['rd_lb'], 2e9 / 64 - 8192)
+    chk("... writes mn - 4096", lb[0]['wr_lb'], 1e6 - 4096)
+    for bad, why in (('k:256 m:96', "no register loops"),
+                     ('n:768 k:768 m:120 k:192 n:nr m:mr', "A packed in m1, whose inner "
+                      "loop k2 cuts A")):
+        try:
+            parse_nest(bad, 4, 12, 'A:m1' if 'm1' in why else '')
+            chk(f"refused: {why}", 0.0, 1.0)
+        except ValueError:
+            chk(f"refused: {why}", 1.0, 1.0)
+
     print(f"\n{'ALL CHECKS PASSED' if ok else 'FAILURES ABOVE'}")
     return 0 if ok else 1
 
@@ -3552,9 +4049,25 @@ def build_parser() -> argparse.ArgumentParser:
                     help='override B read amplification (bytes fetched per '
                          'byte used); line/s for a kernel walking the long '
                          'stride, 1 for one that transposes in registers')
-    ap.add_argument('--kc', type=int, default=256, help='cache block k_c')
-    ap.add_argument('--mc', type=int, default=256, help='cache block m_c')
-    ap.add_argument('--nc', type=int, default=1024, help='cache block n_c')
+    ap.add_argument('--kc', type=int, default=None,
+                    help="Goto's cache block k_c (default 256)")
+    ap.add_argument('--mc', type=int, default=None,
+                    help="Goto's cache block m_c (default 256)")
+    ap.add_argument('--nc', type=int, default=None,
+                    help="Goto's cache block n_c (default 1024)")
+    ap.add_argument('--nest', nargs='+', metavar='LOOP',
+                    help="any member of the MOMMS family instead of Goto's "
+                         "nest: loops outer to inner as dim:block, ending in "
+                         "the register loops m:mr and n:nr (either order); "
+                         "blocks may be multiples of the tile, 4mr.  '|' "
+                         "groups loops into levels, for the name -- quote the "
+                         "whole nest, e.g. --nest \"n:768 k:768 | m:120 k:192 | "
+                         "n:nr m:mr\" (B3A2C0)")
+    ap.add_argument('--pack-at', default='', metavar='A:LOOP,B:LOOP',
+                    help="the loop each operand is packed in, once per "
+                         "iteration, or pre: the loop inside it must keep the "
+                         "operand invariant.  Default: around the first loop "
+                         "below the top that does -- Goto's ic and pc")
     ap.add_argument('--ghz', type=float,
                     help="the core clock, for --cache fields given in ns or GB/s")
     ap.add_argument('--size', type=int, nargs=3, default=[2048, 2048, 2048],
@@ -3620,8 +4133,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--sw-prefetch', nargs='+', default=[], metavar='PF',
                     help='software prefetches, loop:operand:target[:hint'
                          '[:distance]] -- issued in that loop, fetching what '
-                         'its next iteration needs.  loop is k, ir, jr, ic, '
-                         'pc or jc; hint keep (default) or strm; distance is '
+                         'its next iteration needs.  loop is k or a loop of '
+                         'the nest (ir, jr, ic, pc or jc in Goto\'s); hint keep '
+                         '(default) or strm; distance is '
                          'the lead in k-steps: for loop k how far ahead (1 by '
                          'default), for the others how long before use (one '
                          'iteration by default).  e.g. ir:C:L2 k:A:L1:strm:4 '
@@ -3703,7 +4217,21 @@ def main(argv : list[str]=None) -> int:
         return selftest()
 
     u = _make_kernel(ap, a)
-    b = blocking(a.kc, a.mc, a.nc)
+    if a.nest:
+        if any(x is not None for x in (a.kc, a.mc, a.nc)):
+            ap.error("--nest gives the blocks: --kc, --mc and --nc are Goto's")
+        try:
+            b = parse_nest(' '.join(a.nest), u.m_r, u.n_r, a.pack_at)
+        except ValueError as e:
+            ap.error(f"--nest: {e}")
+    else:
+        b = blocking(256 if a.kc is None else a.kc, 256 if a.mc is None else a.mc,
+                     1024 if a.nc is None else a.nc)
+        if a.pack_at:
+            try:
+                b = parse_nest(b.spec(u.m_r, u.n_r).text(), u.m_r, u.n_r, a.pack_at)
+            except ValueError as e:
+                ap.error(f"--pack-at: {e}")
     p = problem(*a.size)
     lv = _make_levels(ap, a)
     pk = packing.preset(a.pack, u.size('B'), lv[0].line)
@@ -3722,6 +4250,11 @@ def main(argv : list[str]=None) -> int:
         sw = [parse_prefetch(t) for t in a.sw_prefetch]
     except ValueError as e:
         ap.error(f"--sw-prefetch: {e}")
+    order = nest_order(make_loop_nest(b, p, u))
+    for sp in sw:
+        if sp.loop not in order:
+            ap.error(f"--sw-prefetch {sp.loop}:{sp.operand}:...: the loops are "
+                     f"{' '.join(order)}")
     if a.rob and a.lookahead:
         ap.error("give --lookahead or --rob, not both")
     win = ooo_window(a.rob, a.load_queue, a.vec_bytes or a.vl) if a.rob else None

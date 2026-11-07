@@ -454,6 +454,49 @@ BLIS's are flagged: the model's in-place repacking rule assumes it.
 The bandwidths, latencies and buffer counts in `--cache` are not in sysfs and
 come from microbenchmarks or vendor data; `detect-cache` fills in the rest.
 
+### Other nests: the MOMMS family
+
+Goto's nest is one member of the MOMMS family (Smith and van de Geijn, *The
+MOMMS Family of Matrix Multiplication Algorithms*, SC19): any sequence of loops
+over m, n and k that ends in the two register loops around the micro-kernel.
+`model.py --nest` takes one, outer to inner, with `|` grouping the loops into
+levels:
+
+```
+model.py --nest "n:1920 | k:256 m:96 | n:nr m:mr"                      # Goto: A2C0
+# the paper's i7-7700K sizes (32K L1, 256K L2, 6M L3; the rest illustrative)
+I7="32K:64:8:64/32:1.0:10:4 256K:64:4:32/32:1.0:16:8 6M:64:12:16/16:1.0:32:30 INF:::8:::200"
+model.py --mr 4 --nr 12 --cache $I7 --nest "n:768 k:768 | m:120 k:192 | n:nr m:mr"   # B3A2C0
+model.py --mr 4 --nr 12 --cache $I7 --nest "m:640 n:640 | k:192 m:120 | n:nr m:mr"   # C3A2C0
+model.py --mr 4 --nr 12 --cache $I7 --nest "m:768 k:768 | n:120 k:192 | m:mr n:nr"   # A3B2C0
+```
+
+The name comes from where the blocks actually fit: the last three need the
+6M L3 for their outer block, and on the default two-level preset they come
+out as B?A2C0, C?A2C0 and A?B2C0.
+
+Every loop keeps the operand it does not index invariant -- an m-loop B, an
+n-loop A, a k-loop C -- so the same ladder, traffic and timing rules apply to
+any nest; a dimension may be cut twice (k by 768, then by 192, the micro-kernel
+running the inner block). Cache blocks may be multiples of the tile (`4mr`).
+Loops are labelled for `--sw-prefetch`: Goto's jc pc ic, otherwise the
+dimension and its count (n1 k1 m1 k2); the register loops are always jr and ir.
+
+A and B are each packed once per iteration of one loop, the one around the
+first loop below the top that keeps them invariant -- Goto's ic and pc, and
+for B3A2C0 the paper's k1 (the 768x768 B block) and k2 (the 120x192 A block).
+`--pack-at A:LOOP,B:LOOP` (or `pre`) moves them; the loop inside must keep the
+operand invariant, so the packed block is reused.
+
+The report names the nest the paper's way -- each group's resident block with
+the innermost cache that holds it, `?` if none does -- and sets each level's
+traffic against the I/O lower bound of Smith, Lowery, Langou and van de Geijn
+(arXiv 1702.02017): at least 2mnk/sqrt(M) - 2M elements read into fast memory
+of M elements, and mn - M written back. A level exclusive of one inside it
+(`v`) counts both capacities.
+
+goto_bench and `validate.py` still run Goto's nest only.
+
 Verification
 ------------
 
