@@ -131,6 +131,12 @@ class cfg:
     :param ldb_b: column stride in bytes, 'row' layout only (default kc*esize)
     :param chunks: chunks simulated
     :param warmup: chunks discarded before averaging
+    :param ldnt: non-temporal strip loads (ldnt1d/ldnt1w): 'none', 'last' for
+                 the last use of each strip inside a chunk (the pass after
+                 which that strip is dead) or 'all'
+    :param ldnt_pol: what a non-temporal miss does -- 'bypass' (no allocation,
+                     the optimistic reading) or 'lru' (allocated at the LRU
+                     end, so it is the first thing evicted)
     :param dc_zva: the first accumulation of a packed block needs no prior AB
                    (it starts at zero), so its accumulator load can be skipped;
                    a dc zva on those lines also avoids a read-for-ownership if
@@ -171,6 +177,8 @@ class cfg:
     ldb_b: int = 0
     chunks: int = 60
     warmup: int = 10
+    ldnt: str = 'none'
+    ldnt_pol: str = 'bypass'
     dc_zva: bool = False
     epilogue: bool = False
     count_wb: bool = False
@@ -235,8 +243,10 @@ class cache:
     :param assoc: ways per set; 0 or size//line means fully associative
     """
 
-    def __init__(self, size : int, line : int, assoc : int = 0):
+    def __init__(self, size : int, line : int, assoc : int = 0,
+                 nt_pol : str = 'bypass'):
         self.line = line
+        self.nt_pol = nt_pol
         self.nline = max(1, size // line)
         if assoc <= 0 or assoc >= self.nline:      # one set of all the lines
             self.ways, self.nsets = self.nline, 1
@@ -250,12 +260,15 @@ class cache:
         self.wb = 0
         self.by = {}
 
-    def access(self, addr : int, dirty : bool = False, tag : str = '') -> bool:
+    def access(self, addr : int, dirty : bool = False, tag : str = '',
+               nt : bool = False) -> bool:
         """
         Touch one line.
 
         :param addr: byte address inside the line
         :param dirty: whether this access leaves the line dirty
+        :param nt: non-temporal: on a miss, do not allocate (policy 'bypass')
+                   or allocate at the LRU end (policy 'lru')
         :return: True if the line was not resident (a fill)
         """
         n = addr // self.line
@@ -267,7 +280,11 @@ class cache:
             return False
         self.fills += 1
         self.by[tag] = self.by.get(tag, 0) + 1
+        if nt and self.nt_pol == 'bypass':
+            return True                     # fetched, used, not cached
         s[key] = dirty
+        if nt:                              # allocate as the first victim
+            s.move_to_end(key, last=False)
         self.used.add(n % self.nsets)
         self.seen.add(n)
         while len(s) > self.ways:
@@ -325,6 +342,28 @@ def addr_b(c : cfg, col : int, k : int) -> int:
             + (k * pd + col % c.n_za) * c.esize)
 
 
+def strip_addrs(c : cfg, first : int, last : int, k : int, a : bool):
+    """
+    Yield one address per line of an A or B strip at one k-step.  In a packed
+    panel the tile's rows (columns) are contiguous, so several share a line and
+    one load covers them; in the row-major layout every row is its own line.
+
+    :param c: configuration
+    :param first: first row/column of the strip
+    :param last: one past the last
+    :param k: k-step
+    :param a: True for A, False for B
+    :return: generator of byte addresses
+    """
+    if c.layout == 'row':
+        for i in range(first, last):
+            yield addr_a(c, i, k) if a else addr_b(c, i, k)
+        return
+    per = max(1, c.line // c.esize)         # elements of the tile per line
+    for i in range(first, last, per):
+        yield addr_a(c, i, k) if a else addr_b(c, i, k)
+
+
 def touches(c : cfg, chunk : int):
     """
     Yield (address, dirty) for every line touched in one k-chunk, in program
@@ -342,15 +381,22 @@ def touches(c : cfg, chunk : int):
     for (r, col) in c.tile_order():
         tile = r * c.cols + col
         cbase = C_BASE + tile * c.tile_bytes
+        # a strip is dead after the last pass that uses it: A(r) after the
+        # last column group, B(cc) after the last row group.  Only those loads
+        # may be non-temporal -- the earlier ones are reused by a later pass.
+        last_r = (r == c.rows - 1)
+        last_c = (col == c.cols - 1)
+        nt_a = c.ldnt == 'all' or (c.ldnt == 'last' and last_c)
+        nt_b = c.ldnt == 'all' or (c.ldnt == 'last' and last_r)
         if c.touch in ('start', 'both') and not first:
             for l in range(c_lines):
                 yield cbase + l * c.line, False, 'AB'
         if c.ab_order == 'k':
             for k in range(k0, k0 + c.k_mu):
-                for row in range(r * c.m_za, (r + 1) * c.m_za):
-                    yield addr_a(c, row, k), False, 'STRIP'
-                for cc in range(col * c.n_za, (col + 1) * c.n_za):
-                    yield addr_b(c, cc, k), False, 'STRIP'
+                for ad in strip_addrs(c, r * c.m_za, (r + 1) * c.m_za, k, True):
+                    yield ad, False, 'STRIP', nt_a
+                for ad in strip_addrs(c, col * c.n_za, (col + 1) * c.n_za, k, False):
+                    yield ad, False, 'STRIP', nt_b
         else:                                   # whole A strip, then whole B
             for row in range(r * c.m_za, (r + 1) * c.m_za):
                 for k in range(k0, k0 + c.k_mu):
@@ -372,13 +418,15 @@ def run(c : cfg) -> dict:
     :param c: configuration
     :return: dict of measurements, per cycle where that makes sense
     """
-    l1 = cache(c.size, c.line, c.assoc)
+    l1 = cache(c.size, c.line, c.assoc, c.ldnt_pol)
     per, wb, re, ab = [], [], [], []
     for chunk in range(c.chunks):
         l1.fills = l1.wb = 0
         l1.by = {}
-        for addr, dirty, tag in touches(c, chunk):
-            l1.access(addr, dirty and c.count_wb, tag)
+        for t in touches(c, chunk):
+            addr, dirty, tag = t[0], t[1], t[2]
+            nt = t[3] if len(t) > 3 else False
+            l1.access(addr, dirty and c.count_wb, tag, nt)
         per.append(l1.fills)
         re.append(l1.by.get('AB', 0))                   # fills paid by the AB buffer
         ab.append(l1.by.get('STRIP', 0))                # ... and by the A/B strips
@@ -640,6 +688,13 @@ def main(argv : list[str] | None = None) -> int:
     ap.add_argument('--ldb', type=int, default=0, help="B column stride in bytes")
     ap.add_argument('--chunks', type=int, default=60, help="chunks simulated")
     ap.add_argument('--warmup', type=int, default=10, help="chunks discarded")
+    ap.add_argument('--ldnt', choices=('none', 'last', 'all'), default='none',
+                    help="non-temporal strip loads (ldnt1d/ldnt1w): 'last' marks "
+                         "the last use of each strip inside a chunk, which is "
+                         "the one that can be spared from the cache")
+    ap.add_argument('--ldnt-pol', choices=('bypass', 'lru'), default='bypass',
+                    help="non-temporal miss: do not allocate, or allocate at "
+                         "the LRU end")
     ap.add_argument('--dc-zva', action='store_true',
                     help="skip the accumulator load on the first chunk of a "
                          "packed block: the first accumulation starts at zero "
@@ -706,7 +761,8 @@ def main(argv : list[str] | None = None) -> int:
                 pass_order=a.pass_order, kc=a.kc, layout=a.layout,
                 packdim_a=a.packdim_a, packdim_b=a.packdim_b, panel_pad=a.panel_pad,
                 lda_a=a.lda, ldb_b=a.ldb,
-                chunks=a.chunks, warmup=a.warmup, dc_zva=a.dc_zva,
+                chunks=a.chunks, warmup=a.warmup, ldnt=a.ldnt,
+                ldnt_pol=a.ldnt_pol, dc_zva=a.dc_zva,
                 epilogue=a.epilogue,
                 count_wb=a.count_wb,
                 peak=peak, l1_bw=a.l1_bw, l1_st_bw=a.l1_store_bw,
