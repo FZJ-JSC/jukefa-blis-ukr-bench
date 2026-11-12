@@ -434,15 +434,61 @@ def run(c : cfg) -> dict:
                 util=[100 * fills / cyc * L / c.mshr for L in c.latency])
 
 
+def _cols(c : cfg) -> list:
+    """
+    Column widths, shared by the header and the rows so the two cannot drift.
+    Numeric columns are right-aligned, so a cell and its label end together.
+
+    :param c: configuration
+    :return: (label, width) per column, in print order
+    """
+    iw = 5 * len(c.latency) - 1        # 4-wide values joined by single spaces
+    return [('shape', 7), ('t', 2), ('k_mu', 5), ('live', 7), ('comp', 7),
+            ('fills', 7), ('L2 B/cy', 7), ('L1 rd/wr', 10), ('sets', 7),
+            ('A/Bf/uniq', 10), ('ABf', 4), ('in-flight', max(iw, 9)), ('|', 1),
+            ('MSHRs', max(iw, len(f"% of {c.mshr} MSHRs")))]
+
+
+def _fit(cells : list, cols : list) -> str:
+    """
+    Join cells at their column widths, refusing to overflow one.
+
+    :param cells: one string per column
+    :param cols: (label, width) per column, from _cols()
+    :return: the formatted line
+    """
+    out = []
+    for cell, (lab, w) in zip(cells, cols):
+        if len(cell) > w:
+            raise AssertionError(f"column {lab!r} is {w} wide, cell {cell!r} "
+                                 f"needs {len(cell)}")
+        out.append(f"{cell:>{w}}")
+    return " ".join(out)
+
+
+def header(c : cfg) -> str:
+    """
+    :param c: configuration
+    :return: two header lines; the second carries the latencies, right-aligned
+             in the "in-flight" column like its values
+    """
+    cols = _cols(c)
+    labels = [h for h, _ in cols]
+    labels[-1] = f"% of {c.mshr} MSHRs"
+    i = len(cols) - 3                          # the in-flight column
+    head = _fit(labels, cols)
+    lat = " ".join(f"{L:>4}" for L in c.latency)
+    pad = sum(w for _, w in cols[:i]) + i      # widths plus the joins
+    return head + "\n" + " " * (pad + cols[i][1] - len(lat)) + lat
+
+
 def fmt(c : cfg, m : dict) -> str:
     """
     :param c: configuration
     :param m: run() output
-    :return: one table row
+    :return: one table row, cells in the same order and widths as _cols()
     """
-    shape = f"{c.m_t}x{c.n_t}"
-    infl = " ".join(f"{x:4.1f}" for x in m['inflow'])
-    util = " ".join(f"{x:4.0f}" for x in m['util'])
+    cols = _cols(c)
     flag = []
     if m['rd_bw'] > c.l1_bw:
         flag.append("load port over")
@@ -454,23 +500,27 @@ def fmt(c : cfg, m : dict) -> str:
         flag.append("live > cache")
     if m['fills_cy'] > m['comp_cy'] * 1.02:
         flag.append("above compulsory")
-    sets = (f"{m['sets_used']:>3}/{m['nsets']:<3} "
-            f"{m['ab_fills']:>5.0f}/{m['ab_unique']:>4.0f} {m['c_fills']:>4.0f}")
     if m['c_fills'] > 0.0 and c.touch != 'none':
         flag.append("AB re-fetched")
     if m['ab_fills'] > m['ab_unique'] * 1.02:
         flag.append("strips re-fetched")
-    return (f"{shape:>7} {c.t:>2} {c.k_mu:>5} {m['live_kb']:>6.0f}K {m['comp_cy']:>7.3f} "
-            f"{m['fills_cy']:>7.3f} {m['l2_bw']:>6.1f} "
-            f"{m['rd_bw']:>5.0f}/{m['wr_bw']:<4.0f} {sets} "
-            f"{infl} | {util} {' '.join(flag)}")
-
-
-def header(c : cfg) -> str:
-    lat = " ".join(f"{L:>4}" for L in c.latency)
-    return (f"{'shape':>7} {'t':>2} {'k_mu':>5} {'live':>7} {'comp':>7} "
-            f"{'fills':>7} {'L2 B/cy':>6} {'L1 rd/wr':>9} {'sets A/Bf/uniq ABf':>19} "
-            f"{'in-flight @ ' + lat:>21} | {'% of ' + str(c.mshr) + ' MSHRs':>17}")
+    cells = [
+        f"{c.m_t}x{c.n_t}",
+        f"{c.t}",
+        f"{c.k_mu}",
+        f"{m['live_kb']:.0f}K",
+        f"{m['comp_cy']:.3f}",
+        f"{m['fills_cy']:.3f}",
+        f"{m['l2_bw']:.1f}",
+        f"{m['rd_bw']:.0f}/{m['wr_bw']:.0f}",
+        f"{m['sets_used']}/{m['nsets']}",
+        f"{m['ab_fills']:.0f}/{m['ab_unique']:.0f}",
+        f"{m['c_fills']:.0f}",
+        " ".join(f"{x:4.1f}" for x in m['inflow']),
+        "|",
+        " ".join(f"{x:4.0f}" for x in m['util']),
+    ]
+    return _fit(cells, cols) + " " + " ".join(flag)
 
 
 # -------------------------------------------------------------- selftest ---
