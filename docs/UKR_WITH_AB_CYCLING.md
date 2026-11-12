@@ -660,9 +660,31 @@ nothing at 11.  What survives at every latency is the L2 read bandwidth
 (32 vs 48-50 B/cy) and the option value of 50 % instead of 81 % MSHR
 occupancy when the L2 latency varies with DRAM contention.
 
+fp32 at SVL=512
+---------------
+The nano tile doubles to 32x32 floats (still 4 KiB of ZA) and an FMOPA covers
+16x16 floats at one per TWO cycles, i.e. 256 FLOP/cy -- the tool derives that
+from `--fmopa-cycles 2` rather than a hand-computed `--peak`.  The traffic per
+cycle is unchanged from fp64 (half the bytes per MAC, twice the MACs), but the
+fill rate in lines/cy halves, so the same shapes come out better [sim, 8-way,
+kc=256, epilogue, 1 FMOPA/2 cy]:
+
+     shape   t  k_mu   live   fills/cy   L2 rd B/cy   L1 rd/wr   ABf
+     32x32   1    16     8 K    0.500       32.0        66/34      0
+     64x32   2    16    14 K    0.375       24.0        67/34      0
+     32x64   2    16    14 K    0.375       24.0        67/34      0
+     64x64   4    16    24 K    0.375       24.0        68/34     64
+
+i.e. in fp32 the TWO-tile version (64x32, split in m) reaches the 0.375 /
+24 B/cy that fp64's four-tile layout cannot, with no AB re-fetch and 14 KiB
+live.  The four-tile version reports the same fill rate but is already losing
+one AB tile per chunk (ABf 64) at 24 KiB live, i.e. it is on the edge of the
+same capacity cliff: at k_mu=32 it costs 0.500 with both streams
+re-fetching (section 5's rule).
+
 If the per-call cost is not solved independently, none of the above shows up
 in wall clock: 300-500 cy/call at 10 240 calls is 18-30 %, and the tile
-cycling *adds* C events.  Hiding the C epilogue (prefetch one tile ahead) is
+cycling *adds* AB events.  Hiding the C epilogue (prefetch one tile ahead) is
 worth +12 to +15 % once the fill queue is relieved, and needs only 64 lines
 = 4 KiB of the 133 KiB of spare L1 bandwidth per call.
 
