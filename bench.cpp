@@ -1,4 +1,4 @@
-#include "dynamic_aligned_allocator.hpp"
+#include "mmgen/dynamic_aligned_allocator.hpp"
 #include "performance_counters/performance_counters.hpp"
 
 #include <omp.h> // Include this first
@@ -83,13 +83,13 @@ int main(int argc, char *argv[])
 
         performance_counters pc(counters);
 
-        auto alloca = archcomp::dynamic_aligned_allocator<double>(alignment, start_offset + (tid * 3 + 0) * offset_step);
-        auto allocb = archcomp::dynamic_aligned_allocator<double>(alignment, start_offset + (tid * 3 + 1) * offset_step);
-        auto allocc = archcomp::dynamic_aligned_allocator<double>(alignment, start_offset + (tid * 3 + 2) * offset_step);
+        auto alloca = mmgen::dynamic_aligned_allocator<double>(alignment, start_offset + (tid * 3 + 0) * offset_step);
+        auto allocb = mmgen::dynamic_aligned_allocator<double>(alignment, start_offset + (tid * 3 + 1) * offset_step);
+        auto allocc = mmgen::dynamic_aligned_allocator<double>(alignment, start_offset + (tid * 3 + 2) * offset_step);
 
-        std::vector<double, archcomp::dynamic_aligned_allocator<double>> A(alloca);
-        std::vector<double, archcomp::dynamic_aligned_allocator<double>> B(allocb);
-        std::vector<double, archcomp::dynamic_aligned_allocator<double>> C(allocc);
+        std::vector<double, mmgen::dynamic_aligned_allocator<double>> A(alloca);
+        std::vector<double, mmgen::dynamic_aligned_allocator<double>> B(allocb);
+        std::vector<double, mmgen::dynamic_aligned_allocator<double>> C(allocc);
 
         for (std::uint64_t kpow = 1; kpow < max_k_power; kpow++)
         {
