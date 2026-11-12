@@ -599,7 +599,16 @@ def main(argv : list[str] | None = None) -> int:
                          "and write (miss stream), per ZA tile, once per kc block")
     ap.add_argument('--count-wb', action='store_true',
                     help="also count dirty evictions (write-backs)")
-    ap.add_argument('--peak', type=float, default=128.0, help="FLOP/cycle in the k-loop")
+    ap.add_argument('--peak', type=float, default=None,
+                    help="FLOP/cycle in the k-loop (default: derived from "
+                         "--fmopa-cycles, else 128 = one 16x32 fp64 FMOPA/cy)")
+    ap.add_argument('--fmopa-cycles', type=float, default=0.0, metavar='N',
+                    help="cycles per FMOPA; sets --peak = m_za*n_za*2/N, which "
+                         "for fp64 at SVL=512 is 1 (128 FLOP/cy) and for fp32 "
+                         "is 2 (256 FLOP/cy)")
+    ap.add_argument('--za-bytes', type=int, default=4096,
+                    help="accumulator size in bytes (4096 at SVL=512, 16384 at "
+                         "SVL=1024); m_za*n_za*esize should match it")
     ap.add_argument('--l1-bw', type=float, default=128.0,
                     help="L1 bytes/cycle for loads, and for loads+stores combined")
     ap.add_argument('--l1-store-bw', type=float, default=64.0,
@@ -619,6 +628,29 @@ def main(argv : list[str] | None = None) -> int:
     mult = {'K': 1024, 'M': 1 << 20}.get(size[-1:], 1)
     size = int(size[:-1]) * mult if mult > 1 else int(size)
     lat = tuple(int(x) for x in a.l2_latency.split(','))
+    # one FMOPA accumulates into an (SVL/esize) x (SVL/esize) sub-tile, not the
+    # whole ZA array: SVL/8 = sqrt(za_bytes) bytes, so sub_side = that / esize
+    sub_side = max(1, int(round((a.za_bytes ** 0.5) / a.esize)))
+    n_fmopa = max(1, (a.m_za // sub_side) * (a.n_za // sub_side))
+    peak = a.peak
+    if a.fmopa_cycles:
+        peak = a.m_za * a.n_za * 2.0 / (a.fmopa_cycles * n_fmopa)
+        if a.peak is not None and abs(a.peak - peak) > 1e-6:
+            ap.error(f"--peak {a.peak} disagrees with --fmopa-cycles "
+                     f"{a.fmopa_cycles} (= {peak} FLOP/cy)")
+    if peak is None:
+        peak = 128.0
+    za = a.m_za * a.n_za * a.esize
+    preamble = []
+    if za != a.za_bytes:
+        preamble.append(f"note: ZA tile is {a.m_za}x{a.n_za}x{a.esize}B = {za} B,"
+                        f" not {a.za_bytes} B; check --m-za/--n-za/--esize")
+    preamble.append(
+        f"ZA {a.m_za}x{a.n_za} x {a.esize} B = {za/1024:.0f} KiB; FMOPA tile "
+        f"{sub_side}x{sub_side}, {n_fmopa} per k-step"
+        + (f" x {a.fmopa_cycles:g} cy" if a.fmopa_cycles else "")
+        + f" -> peak {peak:g} FLOP/cy = {a.m_za*a.n_za*2/peak:.1f} cy per k-step")
+
     base = dict(m_za=a.m_za, n_za=a.n_za, esize=a.esize, line=a.line, size=size,
                 assoc=a.assoc, touch=a.touch, ab_order=a.ab_order,
                 pass_order=a.pass_order, kc=a.kc, layout=a.layout,
@@ -627,12 +659,21 @@ def main(argv : list[str] | None = None) -> int:
                 chunks=a.chunks, warmup=a.warmup, dc_zva=a.dc_zva,
                 epilogue=a.epilogue,
                 count_wb=a.count_wb,
-                peak=a.peak, l1_bw=a.l1_bw, l1_st_bw=a.l1_store_bw,
+                peak=peak, l1_bw=a.l1_bw, l1_st_bw=a.l1_store_bw,
                 mshr=a.mshr, latency=lat)
-    shapes = [(16, 32), (16, 64), (32, 32), (32, 64)] if a.sweep_shapes else [tuple(a.shape)]
-    if any(s is None for s in shapes[0]):
-        ap.error("give --shape M_T N_T, or --sweep-shapes")
+    # the sweep is derived from the ZA shape, so fp32 (32x32) and any other
+    # element size or SVL works: one nano-kernel, then 2 and 4 of them
+    sweep = [(a.m_za, a.n_za),
+             (2 * a.m_za, a.n_za),      # split in m
+             (a.m_za, 2 * a.n_za),      # split in n
+             (2 * a.m_za, 2 * a.n_za)]
+    shapes = sweep if a.sweep_shapes else ([tuple(a.shape)] if a.shape else [])
+    if not shapes:
+        ap.error("give --shape M_T N_T (multiples of the ZA tile "
+                 f"{a.m_za}x{a.n_za}), or --sweep-shapes")
 
+    for line in preamble:
+        print(line)
     print(header(cfg(**base)))
     for (m_t, n_t) in shapes:
         for k_mu in parse_kmu(str(a.k_mu)):
