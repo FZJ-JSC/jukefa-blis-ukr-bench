@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(blis_ukr_bench CXX)
 
-# Require C++17 standard
-set(CMAKE_CXX_STANDARD 17)
+# Require C++20 standard
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -78,7 +78,7 @@ find_library(BLIS_LIBRARY
     REQUIRED
 )
 
-target_include_directories(blis_ukr_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/archcomp/include ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
+target_include_directories(blis_ukr_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/archcomp/include ${CMAKE_CURRENT_SOURCE_DIR}/mmgen/include ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
 target_link_libraries(blis_ukr_bench PRIVATE ${BLIS_LIBRARY} ${EXTRA_LIBS})
 
 if(EXTRA_CFLAGS)
@@ -121,16 +121,25 @@ if(AOCL_MATCH)
     target_compile_definitions(goto_bench PRIVATE AOCL_BLIS)
 endif()
 
-# --- MOMMS composition harness ---
-# A nest composed from rungs (any member of the MOMMS family), packed by
-# BLIS's packm kernel and run by BLIS's micro-kernel: the hand-written GOTO
-# nest's numbers, from data.  Single-threaded, no counters of its own.
-add_executable(momms_bench momms_bench.cpp)
-target_include_directories(momms_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
-target_link_libraries(momms_bench PRIVATE ${BLIS_LIBRARY} ${EXTRA_LIBS} OpenMP::OpenMP_CXX)
+# --- mmgen: GEMMs generated from a nest (MOMMS family) ---
+# A library: generate a GEMM from --nest text, then call it.  Packing is
+# BLIS's packm kernel (or any kernel of that shape); the leaf is BLIS's
+# micro-kernel (or any kernel of that signature, e.g. one from ukrgen).
+# The library itself is kernel-family free: no BLIS headers, no BLIS types.
+# A provider (harness/blis_provider.hpp, or a ukrgen adapter) supplies the leaf.
+add_library(mmgen STATIC mmgen/src/gemm.cpp)
+target_include_directories(mmgen PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/mmgen/include)
 if(EXTRA_CFLAGS)
-    target_compile_options(momms_bench PRIVATE ${EXTRA_CFLAGS})
+    target_compile_options(mmgen PRIVATE ${EXTRA_CFLAGS})
 endif()
+
+# the benchmark for one plan: verify, time, profile
+add_executable(mmgen_bench mmgen_bench.cpp)
+target_include_directories(mmgen_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
+target_link_libraries(mmgen_bench PRIVATE mmgen ${BLIS_LIBRARY} ${EXTRA_LIBS})
 if(AOCL_MATCH)
-    target_compile_definitions(momms_bench PRIVATE AOCL_BLIS)
+    target_compile_definitions(mmgen_bench PRIVATE AOCL_BLIS)
+endif()
+if(EXTRA_CFLAGS)
+    target_compile_options(mmgen_bench PRIVATE ${EXTRA_CFLAGS})
 endif()
