@@ -4,7 +4,8 @@ Fills and residency of a C-cycling SME micro-kernel: an LRU simulation.
 
 `model.py` cannot express this structure (it has one C invariant, the `pc`
 rung sized m*n_c, and no rung below the register loops), so the L1 behaviour
-of a micro-kernel that cycles ZA tiles through a staged C is simulated here
+of a micro-kernel that cycles ZA tiles through a staged partial product
+(AB) is simulated here
 instead: a line-level LRU cache driven by the loop structure, which yields
 the fills/cycle, the L1 and L2 bandwidth per cycle, and the number of misses
 in flight a given L2 latency would need.
@@ -343,23 +344,23 @@ def touches(c : cfg, chunk : int):
         cbase = C_BASE + tile * c.tile_bytes
         if c.touch in ('start', 'both') and not first:
             for l in range(c_lines):
-                yield cbase + l * c.line, False, 'C'
+                yield cbase + l * c.line, False, 'AB'
         if c.ab_order == 'k':
             for k in range(k0, k0 + c.k_mu):
                 for row in range(r * c.m_za, (r + 1) * c.m_za):
-                    yield addr_a(c, row, k), False, 'AB'
+                    yield addr_a(c, row, k), False, 'STRIP'
                 for cc in range(col * c.n_za, (col + 1) * c.n_za):
-                    yield addr_b(c, cc, k), False, 'AB'
+                    yield addr_b(c, cc, k), False, 'STRIP'
         else:                                   # whole A strip, then whole B
             for row in range(r * c.m_za, (r + 1) * c.m_za):
                 for k in range(k0, k0 + c.k_mu):
-                    yield addr_a(c, row, k), False, 'AB'
+                    yield addr_a(c, row, k), False, 'STRIP'
             for cc in range(col * c.n_za, (col + 1) * c.n_za):
                 for k in range(k0, k0 + c.k_mu):
-                    yield addr_b(c, cc, k), False, 'AB'
+                    yield addr_b(c, cc, k), False, 'STRIP'
         if c.touch in ('end', 'both'):
             for l in range(c_lines):
-                yield cbase + l * c.line, True, 'C'
+                yield cbase + l * c.line, True, 'AB'
 
 
 # ------------------------------------------------------------------- run ---
@@ -379,8 +380,8 @@ def run(c : cfg) -> dict:
         for addr, dirty, tag in touches(c, chunk):
             l1.access(addr, dirty and c.count_wb, tag)
         per.append(l1.fills)
-        re.append(l1.by.get('C', 0))                   # fills paid by the C stream
-        ab.append(l1.by.get('AB', 0))                  # ... and by the A/B strips
+        re.append(l1.by.get('AB', 0))                   # fills paid by the AB buffer
+        ab.append(l1.by.get('STRIP', 0))                # ... and by the A/B strips
         wb.append(l1.wb if c.count_wb else 0)
     steady = per[c.warmup:]
     fills = sum(steady) / max(1, len(steady))
@@ -456,9 +457,9 @@ def fmt(c : cfg, m : dict) -> str:
     sets = (f"{m['sets_used']:>3}/{m['nsets']:<3} "
             f"{m['ab_fills']:>5.0f}/{m['ab_unique']:>4.0f} {m['c_fills']:>4.0f}")
     if m['c_fills'] > 0.0 and c.touch != 'none':
-        flag.append("C re-fetched")
+        flag.append("AB re-fetched")
     if m['ab_fills'] > m['ab_unique'] * 1.02:
-        flag.append("A/B re-fetched")
+        flag.append("strips re-fetched")
     return (f"{shape:>7} {c.t:>2} {c.k_mu:>5} {m['live_kb']:>6.0f}K {m['comp_cy']:>7.3f} "
             f"{m['fills_cy']:>7.3f} {m['l2_bw']:>6.1f} "
             f"{m['rd_bw']:>5.0f}/{m['wr_bw']:<4.0f} {sets} "
@@ -468,7 +469,7 @@ def fmt(c : cfg, m : dict) -> str:
 def header(c : cfg) -> str:
     lat = " ".join(f"{L:>4}" for L in c.latency)
     return (f"{'shape':>7} {'t':>2} {'k_mu':>5} {'live':>7} {'comp':>7} "
-            f"{'fills':>7} {'L2 B/cy':>6} {'L1 rd/wr':>9} {'sets  ABf/uniq  Cf':>18} "
+            f"{'fills':>7} {'L2 B/cy':>6} {'L1 rd/wr':>9} {'sets A/Bf/uniq ABf':>19} "
             f"{'in-flight @ ' + lat:>21} | {'% of ' + str(c.mshr) + ' MSHRs':>17}")
 
 

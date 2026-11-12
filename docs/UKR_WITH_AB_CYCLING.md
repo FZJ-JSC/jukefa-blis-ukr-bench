@@ -1,12 +1,17 @@
-SME micro-kernel with C cycling
-===============================
+SME micro-kernel with AB cycling
+================================
 
 Design notes for a BLIS micro-kernel on an SME core (SVL = 512 bits, fp64) in
 which the ZA array is cycled through several tiles inside one micro-kernel
-call, with C staged in memory and a k-chunk depth as the tuning knob.  Nothing
-here is implemented: the numbers are traffic estimates, a residency
-simulation, and predictions from `model.py` where it can express the
-structure at all.
+call: the partial product (AB) is staged in L1 between passes, C is touched
+only in the epilogue, and the k-chunk depth is the tuning knob.  Nothing here
+is implemented: the numbers are traffic estimates, a residency simulation, and
+predictions from `model.py` where it can express the structure at all.
+
+Vocabulary, since the two are easy to confuse: AB is the accumulated product
+of this call -- what ZA holds and what gets staged in L1 -- and C is the
+caller's matrix, read and written once per packed block in the epilogue.
+"Accumulator" below always means the AB tile, never C.
 
 Status: `model.py` on this branch CANNOT express the design.  `--nest`
 requires the innermost loops to be the register loops:
@@ -16,7 +21,9 @@ requires the innermost loops to be the register loops:
 
 so there is exactly one C invariant in the model (the `pc` rung, sized
 `M x n_c`) and no way to put a k rung below the register loops whose
-invariant is a ZA-sized C tile.  See "Model gaps" at the end.
+invariant is a ZA-sized *accumulator* tile (AB here).  The model also has no
+AB at all: it charges C's traffic per `pc` pass, which is the same shape as
+AB staging but a different operand.  See "Model gaps" at the end.
 
 Contents
 --------
@@ -113,16 +120,18 @@ that A and B strips are shared across ZA passes:
 
   t        number of ZA tiles in the logical tile (1, 2, 4, ...)
 
-Vocabulary, because two of these names coincide on SME.  One ZA pass over one
-ZA array of AB for k_mu k-steps is the *nano-kernel*: m_za x n_za doubles
-(16x32 fp64 at SVL=512). That is also BLIS's MR x NR whenever the
-micro-kernel fits into the ZA array (MR/NR are ofter referred to as register-tile
-in BLIS, ZA is the SME accumulator. At SVL=512 there are 8 fp64 slices/subtiles 
-za0-za7 that are 8x8 elements each). If the MR x NR tile is larger than ZA, it's
-a *logical tile* (rows x cols nano-kernels, `--shape`) and requires cycling.
-If a port defines MR/NR as several ZA tiles, then the logical tile plays MR/NR 
-and the packdim follows the packed width, not the nano width.
-  k_mu     k-steps per ZA pass: the knob that trades C traffic against the
+Three shapes, and the names matter.  One ZA pass over one ZA array of AB for
+k_mu k-steps is the *nano-kernel*: m_za x n_za doubles = 16x32 fp64 at
+SVL=512 (8 fp64 subtiles za0-za7 of 8x8 each, which is what one FMOPA
+accumulates into).  BLIS calls its register-resident tile MR x NR; on SME the
+register file for accumulators IS ZA, so MR x NR = the nano shape whenever the
+micro-kernel is exactly one ZA array.  A micro-kernel whose tile is larger
+than ZA -- the design here -- cannot hold MR x NR in registers at all: that is
+what forces the cycling, the logical tile (rows x cols nano-kernels,
+`--shape`) plays the role of MR/NR, and the packed panel width follows the
+logical tile, not the nano shape.
+
+  k_mu     k-steps per ZA pass: the knob that trades AB traffic against the
            L1 footprint of the A/B strips
   tile     how the t tiles are arranged.  Splitting in m matters:
            32x32 is better than 16x64, see section 5.
@@ -131,9 +140,10 @@ What it buys: A is reused across column groups and B across row groups
 without either being resident at full panel depth, so the strips come from
 L1 instead of L2.
 
-What it costs: every ZA pass moves its 4 KiB accumulator out and back, i.e.
-2 x 4 KiB per tile per chunk, and the C buffer (t x 4 KiB) competes with the
-strips for L1.
+What it costs: every ZA pass moves its 4 KiB AB tile out and back, i.e.
+2 x 4 KiB per tile per chunk, and the AB buffer (t x 4 KiB) competes with the
+strips for L1.  C itself is not part of that: it is read and written once per
+packed block, in the epilogue.
 
 
 4. Requirements at 1 FMOPA/cycle
@@ -147,9 +157,9 @@ and 384 B of A/B [calc]:
                                                  takes z-register operands and
                                                  each ZA pass can only reuse
                                                  the vectors it holds
-    AB loads+stores      = 1024/k_mu B/cy         one 4 KiB accumulator
-                                                 out and back, per tile per
-                                                 chunk, independent of t
+    AB loads+stores      = 1024/k_mu B/cy         one 4 KiB AB tile out and
+                                                 back, per tile per chunk,
+                                                 independent of t
     L1 total            = 48 + 1024/k_mu B/cy
 
 The two L1 ports make that split matter.  The core has one load-only port and
@@ -196,7 +206,9 @@ which is what a bigger logical tile actually reduces:
     resident in the accumulator: at fp64 that is 16 KiB of ZA, i.e. SVL=1024.
     At SVL=512 a 32x64 tile must cycle, which is what costs the second
     24 B/cy.  If a wider SVL is on the roadmap it beats every cycled variant
-    here outright -- no AB reload traffic at all.
+    here outright -- no AB reload traffic at all.  Note that 0.375 is a BOUND
+    for A/B fills: reaching it also needs the AB buffer to survive each pass,
+    which section 5 shows the 4-tile layout cannot do with packdim = MR/NR.
 
 AB fills, when the accumulator does not fit L1 [calc]:
 
@@ -266,16 +278,6 @@ still 103 of 128 at k_mu=32).  dc zva on the first store of each tile removes
 that risk; without it the design is one microarchitectural detail away from not
 fitting at all.  --dc-zva models the read saving.
 
-MLP requirement = fills/cy x L2 latency; at 25 cy [calc].  All per-cycle
-figures in this document use the peak-rate denominator: 8 cy/k, i.e. the
-time the k-loop would take at 1 FMOPA/cy.  The model's own achieved-rate
-denominator is different because it predicts 61 %, not peak.
-
-    k_mu=16, accumulator resident   0.500 fills/cy -> 13 in flight
-    k_mu=32, accumulator resident   0.500 fills/cy -> 13    (32x32, 24 KiB)
-    k_mu=64, accumulator spilled    0.625 fills/cy -> 16    (32x32, 40 KiB)
-    today (16x32, kc=208)           0.805 fills/cy -> 20   [model]
-
 Latency: ADDITIVE, and the figure matters a lot.  The model's `--cache`
 latency field is what a level ADDS to a miss from the level inside it, not
 load-to-use (module docstring: total hits of 7/14/46 cycles are written
@@ -318,9 +320,9 @@ is what determines the fill rate (section 5):
     point (fills/cy)          11 cy        16 cy        21 cy        25 cy
     today, 16x32     0.805   8.9  55 %   12.9  81 %   16.9 106 %   20.1 126 %
     32x32 k_mu<=32   0.500   5.5  34 %    8.0  50 %   10.5  66 %   12.5  78 %
-    32x64 k_mu=32    0.625   6.9  43 %   10.0  63 %   13.1  82 %   15.6  98 %
+    32x64 k_mu=16    0.625   6.9  43 %   10.0  63 %   13.1  82 %   15.6  98 %
     32x32 k_mu=64    0.625   6.9  43 %   10.0  63 %   13.1  82 %   15.6  98 %
-    32x64 k_mu=16    0.750   8.3  52 %   12.0  75 %   15.8  98 %   18.8 117 %
+    32x64 k_mu=32    0.750   8.3  52 %   12.0  75 %   15.8  98 %   18.8 117 %
 
     max sustainable fill rate = mshr / latency:  1.45/cy   1.00/cy   0.76/cy   0.64/cy
 
@@ -357,8 +359,8 @@ Three consequences:
 
   * A 16-cycle L2 makes today's kernel feasible with ~13 of 16 MSHRs rather
     than over-subscribed, so the measured 8 cy/k is consistent with an
-    ordinary 16-entry MSHR file.  Section 2's "needs ~17 outstanding fills"
-    is an artefact of the 21-cy guess.  (The model's fill-buffer test is not
+    ordinary 16-entry MSHR file.  Section 2's "needs ~12.7 outstanding fills"
+    already reflects the 16-cy figure; the 17 came from the 21-cy guess.  (The model's fill-buffer test is not
     exactly this product -- it also pools C's burst waves -- so treat the
     table as first order.)
   * The design's MLP motivation shrinks: 20 -> 13 at 21 cy becomes 13 -> 8 at
@@ -383,7 +385,8 @@ constraint anywhere in the feasible region.
 
 DRAM (whole GEMM), in passes of one matrix, with
     jc = ceil(N/n_c), ic = ceil(M/m_c), pc = ceil(K/k_c),
-    tau = 1 if the C accumulator spans the kc blocks, else tau = pc [calc]:
+    tau = 1 if AB accumulates across the packed k-blocks (this design, since
+    the AB buffer outlives them), else tau = pc [calc]:
 
     reads  = jc (A source) + 1 (B source) + ic (B per m-block) + tau (C)
     writes = tau (C) + 1 (B packed write-back) + [jc if A_c evicted]
@@ -393,18 +396,16 @@ At N=1024 (jc=1, ic=6, pc=5), one pass = N^2 doubles = 8.4 MB:
     today (tau=pc=5):  reads 13 passes = 109 MB   writes 6 = 50 MB
     design (tau=1):    reads  9 passes =  75 MB   writes 2 = 17 MB
 
-So the micro-blocking does NOT change DRAM traffic by itself; only the
-accumulator's lifetime does.  Nothing new appears in DRAM either: the C
-buffer is not extra traffic, it is where C lives.
+The C term is the real C here, and only it moves: today the C tile is read
+and written once per packed k-block (pc times per tile), in the design once
+per (ic,jr) tile, in the epilogue, because AB keeps accumulating across the
+k-blocks.  That is a property of AB's lifetime, not of the cycling -- the same
+saving is available by accumulating across k-blocks in any structure.
 
-Requirement summary at 1 FMOPA/cy [calc]:
-
-    k_mu   L1 B/cy   fills/cy   L2 rd B/cy   live set (32x32)   comment
-      16      112       0.500         32           16 KiB        L1 88 %
-      24       91       0.500         32           20 KiB
-      32       80       0.500         32           24 KiB        recommended
-      48       69       0.583         37           32 KiB        at the edge
-      64       64       0.625         40           40 KiB        spills
+AB itself adds NOTHING to DRAM, and should not be counted there: the staging
+buffer is t x 4 KiB (8-16 KiB), which is nothing against the 768 KiB L2, so
+its read-modify-writes are L1/L2-local at worst.  Only if the buffer were
+larger than L2 would AB appear in this table at all.
 
 
 5. Residency: what actually stays in L1 (simulation)
@@ -455,34 +456,35 @@ k-step versus whole-A-strip-then-whole-B-strip (the strips are small, both fit);
 load-then-store versus store-then-load within a pass (same lines).  Order
 choices that DO change it: the pass order inside a chunk (tile-major in m
 versus in n: 0.375 -> 0.625 at 32x64/k_mu=16), and tile-major ACROSS chunks
-(all k for tile 1, then tile 2), which removes the C cycling entirely and
+(all k for tile 1, then tile 2), which removes the AB cycling entirely and
 reverts to the 16x32 row.
 
-Table [sim], with the load+store accumulator pattern:
+Fully associative baseline [sim], load+store accumulator pattern, and (for
+the 32x64 row only) packdim = the nano shape -- see the MR/NR table below for
+what a real build can have:
 
-    tile    t  k_mu     live set    fills/cy    L2 rd B/cy   L1 B/cy
-    16x32   1  8-48      7-22 K       0.750         48       176-69
-    16x64   2  8-32     13-28 K       0.625         40       176-80
-    32x32   2  8-48     12-32 K       0.500         32       176-69
-    32x64   4  8-16     22-28 K       0.375         24       176-112
-    32x64   4  20-48    31-52 K    0.775-0.844    50-54      99-69
+    tile    t  k_mu     live set    fills/cy    L2 rd B/cy
+    16x32   1  8-48      7-22 K       0.750         48
+    16x64   2  8-32     13-28 K       0.625         40
+    32x32   2  8-48     12-32 K       0.500         32
+    32x64   4  8-16     22-28 K       0.375         24   (nano packdim only)
+    32x64   4  20-48    31-52 K    0.775-0.844    50-54
 
 Readings:
 
   * The compulsory rates of section 4 are ACHIEVABLE, but only where the whole
-    live set -- A/B strips plus the accumulator -- fits: 0.500 at 32x32 up to
-    k_mu=48, and 0.375 at 32x64 for k_mu <= 16.  The 32x64 point delivers the
-    24 B/cy of L2 traffic that a resident 4-tile accumulator would, with the
-    accumulator living in L1 instead of in ZA.
-  * 32x64 is a knife edge: the window is k_mu = 14-18 (live set 26-30 K of
-    32 K).  At k_mu=20 it collapses to 0.775, worse than the 2-tile design.
-    32x32 is the robust point -- flat from k_mu=8 to 48 -- at 32 B/cy instead
-    of 24.
-  * Both need k_mu >= 16 to stay inside the L1 bandwidth budget (112 B/cy at
-    k_mu=16, 176 at k_mu=8), so the two knobs are not independent: the L1
-    bandwidth requirement 48 + 1024/k_mu pulls k_mu UP while the capacity
-    requirement (M_t+N_t) k_mu 8 + t 4 KiB < L1 pulls it DOWN.  k_mu=16 is
-    where they meet for t=4; k_mu=16-32 for t=2.
+    live set -- A/B strips plus the AB buffer -- fits: 0.500 at 32x32 up to
+    k_mu=48, and 0.375 at 32x64 for k_mu <= 16.  The 32x64 point reaches the
+    24 B/cy that a resident 4-tile accumulator would, with AB living in L1
+    instead of in ZA -- but see the layout section: it needs packdim = the
+    nano shape, which a cycling kernel cannot have.
+  * 32x32 is the robust point -- flat from k_mu=8 to 48 at 32 B/cy -- and is
+    the one section 6 recommends.  32x64 is a knife edge (window k_mu = 14-18,
+    live set 26-30 K of 32 K) and collapses to 0.775 at k_mu=20.
+  * The two knobs are not independent: the L1 bandwidth requirement
+    48 + 1024/k_mu pulls k_mu UP while the capacity requirement
+    (M_t+N_t) k_mu 8 + t 4 KiB < L1 pulls it DOWN, so t=2 wants k_mu=16-32
+    and t=4 only k_mu=14-18.
   * A/B eviction (a strip fetched twice because the first copy was pushed out)
     appears only where the live set is far past L1: at 32x64/k_mu>=20 the
     shortfall against the compulsory formula is A/B re-fetch, not AB, and it is
@@ -527,26 +529,21 @@ shape (i.e. the layout you get with no cycling at all) [sim]:
      32x32    16     16 K        0.500              0.500
      32x32    32     24 K        0.500              0.500
      32x64    16     28 K        0.375              0.375
-     32x64    32     40 K        0.871              0.871 (over L1 capacity)
+     (rows past L1 capacity are in the MR/NR table below, where they matter)
 
-i.e. the compulsory rates survive a real 8-way L1 -- PROVIDED the panel
-stride is friendly.  It is a discrete, stride-dependent effect, not a smooth
-degradation [sim, 32x64/k_mu=16]:
-
-     kc = 128, 192, 256     0.375        panel stride a multiple of the cache
-     kc = 208               0.500        panels offset by half the set count
-     kc = 216               0.438
-     packdim-a = 20 / 24    0.531 / 0.418   padding is not automatically good
+i.e. with no cycling at all the compulsory rates survive a real 8-way L1.
+Take this table as a reference point only: it needs packdim = the nano shape,
+and the realistic layout follows below.
 
 Padding the STORED panel width (packdim, i.e. what BLIS_PACKDIM_MR/_NR does) is
 the wrong knob here, and the simulation now says why.  packdim sets the stride
-between consecutive k inside a panel; the accumulator is 16 KiB contiguous,
-which is 4 lines in every one of the 64 sets, so it tolerates only 4 ways of
-streaming per set.  Any packdim whose k stride in LINES is a multiple of 2
+between consecutive k inside a panel; the AB buffer is contiguous -- 8 KiB at
+t=2, 16 KiB at t=4 -- which is 2 and 4 lines respectively in every one of the
+64 sets, so it leaves 6 and 4 ways of streaming per set.  Any packdim whose k stride in LINES is a multiple of 2
 concentrates the strips onto fewer sets and starves AB [sim, 32x64/k_mu=16,
-kc=192, 8-way; "Cfills" is AB lines re-fetched per chunk, 512 cycles]:
+kc=192, 8-way; ABf is AB lines re-fetched per chunk, 512 cycles]:
 
-     packdim a/b  k stride   sets the strips use   Cfills   fills/cy
+     packdim a/b  k stride   sets the strips use      ABf   fills/cy
      16 / 32      2 / 4 L    64 / 64                    0      0.375
      32 / 32      4 / 4 L    32 / 64                   64      0.500
      24 / 40      3 / 5 L    64 / 55                   51      0.498
@@ -557,7 +554,7 @@ and padding the PANEL stride instead (--panel-pad, which leaves the k stride
 alone) moves 0.375 to 0.379-0.387 only, so panel aliasing is not the limiter:
 the k stride is.
 
-With packdim = MR/NR = the LOGICAL tile -- the only layout a AB-cycling kernel
+With packdim = MR/NR = the LOGICAL tile -- the only layout an AB-cycling kernel
 can have, since the accumulator is one ZA array at a time -- the same table
 becomes [sim, 8-way, kc = 192 or 208]:
 
@@ -572,10 +569,10 @@ So the two-tile tile keeps its compulsory rate in a real build and the four-
 tile one does not: its wider packed panel is what costs it the accumulator.
 
 Past k_mu ~ 32 BOTH streams lose lines, and the tool reports them separately
-(ABf is A/B fills per chunk, uniq the unique A/B lines, Cf the accumulator's)
-[sim, 8-way, kc=192]:
+(A/Bf is strip fills per chunk, uniq the unique strip lines, ABf the
+accumulator's) [sim, 8-way, kc=192]:
 
-     shape  k_mu   A/B fills/uniq  AB fills   fills/cy
+     shape  k_mu   A/Bf / uniq     ABf       fills/cy
      32x32    16      128 / 128         0     0.500     exact
      32x32    32      256 / 256         0     0.500     exact
      32x32    48      384 / 384         0     0.500     exact
@@ -589,17 +586,13 @@ i.e. the capacity rule applies to the strips as much as to the accumulator:
 once the live set passes L1, A/B is re-fetched 1.8x and the bigger tile buys
 nothing at all.
 
-The "16 / 32" row above is only available when MR/NR equals the nano shape,
-i.e. when there is no cycling.  In the design MR/NR is the logical tile, so
-packdim = --shape and the k stride is the padded width by construction: the
-realistic rows are 32/32 (32x32 -> 0.500, accumulator whole) and 32/64
-(32x64 -> 0.625, 96 lines re-fetched).  That is why section 6 recommends the
-two-tile version: not a quarter of the fills more, but a design that cannot
-avoid the padding.
+That is why section 6 recommends the two-tile version: not because it gives a
+quarter of the fills more, but because with packdim = --shape it is the only
+one that cannot avoid the padding.
 
-So a single 8-way number is not meaningful: sweep kc and packdim, and note
-that the 4-tile point's 0.375 holds only for the friendly strides while the
-32x32 point is 0.500 in every configuration tried.
+So a single 8-way number is not meaningful: sweep kc and packdim.  The 4-tile
+point's 0.375 needs packdim = the nano shape and is not reachable in a real
+build, while the 32x32 point reads 0.500 in every configuration tried.
 
 For contrast, the row-major layout with a 1024-byte leading dimension (1024 B
 = 16 lines = a quarter of the 64 set count) gives SIX fills per cycle -- every
@@ -612,13 +605,14 @@ the associativity, is the thing to model first.
 
 Two points survive, the second only on paper [calc/sim]:
 
-  A. 32x32 (t=2, split in m), k_mu = 16..32 -- the one to build
-       fills             0.500/cy  vs 0.788 today   (1.6x fewer)
+  A. 32x32 (t=2, split in m), k_mu = 24..32 -- the one to build
+       fills             0.500/cy  vs 0.805 today   (1.6x fewer)
                          AB never re-fetched: 0 accumulator lines per chunk
        L2 read           32 B/cy   vs 48-50 today
-       L1 bandwidth     112 B/cy at k_mu=16 (88 % of ~128), 80 at k_mu=32
+       L1 bandwidth     97 B/cy at k_mu=24 (76 % of 128), 84 at k_mu=32
+                        (67 %); k_mu=16 is the same fills at 119 B/cy (93 %)
        in-flight         8 at 16 cy, 13 at 25 cy   (13 at 16 cy today)
-       live set          16 KiB at k_mu=16 (50 %), 24 at k_mu=32 (75 %)
+       live set          20 KiB at k_mu=24 (62 %), 24 at k_mu=32 (75 %)
        holds at kc = 192/208/256, at 8 ways as well as fully associative
 
   B. 32x64 (t=4, split 2x2), k_mu = 16 -- WORSE than A in a real build
@@ -627,17 +621,19 @@ Two points survive, the second only on paper [calc/sim]:
                          96 accumulator lines are re-fetched per chunk
        L2 read           40 B/cy;  live set 28 KiB (87 %), no slack
        the 0.375 / 24 B/cy figure needs packdim = 16/32, i.e. MR/NR = the
-       nano shape -- which is exactly what a C-cycling micro-kernel does not
+       nano shape -- which is exactly what an AB-cycling micro-kernel does not
        have (section 5)
 
-Both need the accumulator re-touched at both ends of every ZA pass (load AB,
+Both need the AB buffer re-touched at both ends of every ZA pass (load AB,
 store AB); with a single touch per pass the 4-tile point degrades to 0.750 and
 the exercise is pointless (section 5).  AB traffic is 64 passes over AB at
-k_mu=16, all L1/L2-local; DRAM is unchanged unless the accumulator spans the
-kc blocks (tau=1: reads 13 -> 9 passes, writes 6 -> 2).
+k_mu=16, all L1/L2-local.  The DRAM saving (tau=1: reads 13 -> 9 passes,
+writes 6 -> 2) comes from C being touched once per (ic,jr) tile in the
+epilogue rather than once per packed k-block -- not from the cycling, and not
+from any AB traffic, which never leaves L1/L2.
 
 A wins, and the reason is a constraint rather than a tuning choice: the packer
-writes panels MR x kc / NR x kc, and in a AB-cycling micro-kernel MR/NR IS the
+writes panels MR x kc / NR x kc, and in an AB-cycling micro-kernel MR/NR IS the
 logical tile (the accumulator is only one ZA array at a time, so nothing
 smaller is "resident").  packdim therefore equals --shape, not the nano shape,
 and the k stride inside a nano-pass is the padded width: 4 lines for A and 8
@@ -649,8 +645,9 @@ B slab, so nothing changes for B, and its A panel at 32 rows only doubles a
 strided footprint that was already half the sets; the accumulator stays whole
 (0 lines re-fetched).
 
-So the honest summary: 1.6x fewer fills and 1.6x less L2 read, at 88 % of L1
-bandwidth and 50 % of its capacity, from the two-tile tile at k_mu=16.  The
+So the honest summary: 1.6x fewer fills and 1.6x less L2 read, at 76 % of L1
+bandwidth and 62 % of its capacity, from the two-tile tile at k_mu=24 (all
+inclusive of the epilogue).  The
 24 B/cy resident-tile number is not reachable with packdim = MR/NR = the
 logical tile; it would need either no cycling at all (MR/NR = one ZA array,
 i.e. today's kernel) or an SVL wide enough that the logical tile fits ZA
@@ -672,6 +669,10 @@ worth +12 to +15 % once the fill queue is relieved, and needs only 64 lines
 
 7. Closed forms for the standard counters
 -----------------------------------------
+
+In this section C is the REAL C of `model.py`, which has no AB staging: do
+not rename these terms to AB.  The forms are used above to price the design's
+epilogue and to compare against the current kernel.
 
 Used above, and validated by exact-integer agreement with `model.py` over
 square and rectangular problems, jc = 1 and jc = 2, and four residency
@@ -744,29 +745,33 @@ Notes that cost time to work out, worth keeping:
 ----------
 
   * Everything about L1 capacity is a model/simulation statement, not a
-    measurement.  The 128 B/cy L1 bandwidth and the MSHR count are still
-    guesses, and the L2 latency is only reported as "~16 cycles" without
+    measurement.  The port split (128 B/cy of loads, or 64 + 64) is measured;
+    the MSHR count and the L1 latency are still guesses, and the L2 latency is
+    only reported as "~16 cycles" without
     saying whether that is additive or load-to-use -- which is worth 15
     percentage points of predicted peak (section 4).  Re-derive both before
     trusting any "does not fit" conclusion.
   * Associativity is now simulated (--assoc) and it is the LAYOUT that
-    decides: with packed panels and a friendly stride an 8-way L1 keeps the
-    compulsory rates, with an awkward one it does not (0.375 -> 0.5 -> 0.53 at
-    kc = 192 -> 208 -> pad 20).  A row-major model with a 1024 B leading
-    dimension thrashes outright (6 fills/cy).  Still unmodelled: the real
+    decides, not the associativity: with packdim = MR/NR = the logical tile an
+    8-way L1 keeps the 2-tile compulsory rate exactly (0.500, 0 AB fills) but
+    costs the 4-tile one a fifth of its accumulator (0.625, 96 lines per
+    chunk); a row-major model with a 1024 B leading dimension thrashes
+    outright (6 fills/cy).  Still unmodelled: the real
     packed strides (use --packdim-a/-b to match BLIS_PACKDIM_MR/_NR) and any
-    prefetcher, which in hardware fetches A/B ahead and displaces the
-    accumulator in exactly the way the C touch pattern is fighting.
+    prefetcher, which in hardware fetches A/B ahead and displaces the AB
+    buffer in exactly the way the accumulator touch pattern is fighting.
   * Section 5 also assumes the pass order 1,2,3,4 inside each chunk.  A
-    tile-major order (all chunks of tile 1, then tile 2) removes the C
-    cycling entirely, reverting to today's 0.75 fills with no C cost.
-  * The design needs C staged somewhere; `str za` can write back into C
-    itself (in-place read-modify-write, 64 B aligned), so no separate buffer
-    is required for C.  The packed panels are the buffer problem: A_c 312 KB,
-    B_c 1.66 MB at kc=208, which cannot come from a stack buffer --
-    BLIS_STACK_BUF_MAX_SIZE is registers x register width (a few KiB,
-    frame/include/bli_kernel_macro_defs.h:192), with
-    BLIS_INSUFFICIENT_STACK_BUF_SIZE as the guard.
+    tile-major order (all chunks of tile 1, then tile 2) removes the AB
+    cycling entirely, reverting to today's 0.75 fills with no AB cost.
+  * AB needs a buffer of its own: t x 4 KiB (8 KiB at t=2, 16 KiB at t=4),
+    which cannot be C itself, because C still holds the previous accumulation
+    until the epilogue consumes it.  So the design pays for a staging buffer
+    that a register-accumulator kernel does not have -- 8-16 KiB is more than
+    BLIS_STACK_BUF_MAX_SIZE (registers x register width, a few KiB,
+    frame/include/bli_kernel_macro_defs.h:192, with
+    BLIS_INSUFFICIENT_STACK_BUF_SIZE as the guard), so it comes from the pool
+    or an explicit stack allocation.  The packed panels are the *other*
+    buffer problem: A_c 312 KB, B_c 1.66 MB at kc=208.
   * Whether the 300-500 cy per-call cost is per packed k-block call (pc
     outside, 5 calls per tile at N=1024) or per (ic,jr) tile (one call over
     all k) changes the whole picture: in the latter case the epilogue is 5x
@@ -789,7 +794,8 @@ Notes that cost time to work out, worth keeping:
   * `parse_nest` rejects a nest that does not end in `m:mr n:nr`, so no rung
     can sit below the register loops; the micro-kernel's k-loop is the one
     non-rung case.
-  * There is one C invariant, the `pc` rung, sized M x n_c.
+  * There is one C invariant, the `pc` rung, sized M x n_c -- and it is the
+    real C; there is no AB in the model at all.
   * `kc` conflates two things an SME kernel separates: the packed A/B block
     depth (panel footprint, packing traffic) and C's lifetime (epilogue
     frequency, C DRAM traffic).
@@ -800,7 +806,7 @@ ceil(K/k_accum) instead of per ceil(K/kc), leaving the panel footprint and
 the packing tied to kc.  With the default k_accum = kc the existing numbers
 must be reproduced exactly, so `scripts/eqcheck.sh` should show additions
 only.  Then tau becomes an input rather than a hand-set quantity, and the
-C-fill term 8/k_mu becomes decomposable from the rung structure.
+AB-fill term 8/k_mu becomes decomposable from the rung structure.
 
 If the chunk rung is added properly, two pitfalls already known from the
 MOMMS work apply: beta belongs at the first k-step of every chunk, not at
@@ -817,11 +823,13 @@ rate and its own level (the accumulator's home), not `--epi-peak`.
   1. Real L1D MSHR/fill-buffer count, and whether the ~16-cycle L2 figure is
      additive or load-to-use.  Those two numbers decide whether the kernel is
      fill-queue-limited at 72 % (16 MSHRs, 16 cy additive) or compute-limited
-     at 87 % (32 MSHRs, or 11 cy additive), and therefore whether C cycling
+     at 87 % (32 MSHRs, or 11 cy additive), and therefore whether AB cycling
      has a job to do at all.
   2. Whether the core can make A/B loads non-allocating (or L1D ways can be
-     locked): that is the difference between the 0.500 and 0.375 fill rates,
-     and between t=2 and t=4 being the right shape.
+     locked).  That is what would let the 4-tile version survive packdim = the
+     logical tile: with the strips not allocating at all, the AB buffer would
+     keep its 4 ways per set and 32x64 would reach its compulsory 0.375,
+     against 0.500 for the 2-tile version built today.
   3. Decomposition of the 300-500 cy/call: ZA load, ZA store, alpha/beta
      scaling, loop setup.  Without it the prefetch/lookahead case cannot be
      sized.
@@ -829,4 +837,4 @@ rate and its own level (the accumulator's home), not `--epi-peak`.
      accumulator is actually flushed.
   5. Per-call and per-k cost with the tile at 32x32 to confirm the strip
      sharing: 8 cy/k should hold if the strips hit L1, and the per-call cost
-     should not grow by the C cycling.
+     should not grow by the AB cycling.
