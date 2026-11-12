@@ -454,10 +454,47 @@ one-touch pattern and therefore overstated the 4-tile case (0.750 instead of
 Order choices that do NOT change the result here: A and B interleaved per
 k-step versus whole-A-strip-then-whole-B-strip (the strips are small, both fit);
 load-then-store versus store-then-load within a pass (same lines).  Order
-choices that DO change it: the pass order inside a chunk (tile-major in m
-versus in n: 0.375 -> 0.625 at 32x64/k_mu=16), and tile-major ACROSS chunks
-(all k for tile 1, then tile 2), which removes the AB cycling entirely and
-reverts to the 16x32 row.
+choices that DO change it: the pass order inside a chunk, and tile-major
+ACROSS chunks (all k for tile 1, then tile 2), which removes the AB cycling
+entirely and reverts to the 16x32 row.
+
+The pass order inside a chunk only matters when the panels are packed to the
+LOGICAL tile (packdim = MR/NR), as in a real build: with nano packdim it makes
+no difference at all (0.375 either way, fully associative or 8-way).  And its
+sense is the opposite of what an earlier version of this paragraph claimed
+[8-way, kc=256, 32x64, k_mu=16, no non-temporal loads]:
+
+    pass order      fills/cy   L2 rd B/cy   note
+    row (in m)       0.625       40.0       strips re-fetch too (224/192)
+    col (in n)       0.504       32.2       compulsory, AB intact (194/192)
+
+At t=4 each strip is used by two of the four passes, so exactly one strip
+crosses a pass boundary and must survive two passes of streaming: row order
+protects B, col order protects A.  With the 16x32 nano, B is the wide strip
+(4 lines per k-step, 512 B) and A the narrow one (2 lines, 256 B), so col order
+protects half as much set AND leaves the previous pass's wide dead strip as the
+eviction runway -- twice the already-dead lines to evict before AB is touched.
+Transposing the nano tile (32x16) reaches the same exchange by making B narrow,
+which is why a mirrored micro-kernel appears specially suited to large k_mu.
+It is the same run: 32x64 with col order and 64x32 (32x16 nano) with row order
+agree to two lines at every k_mu tested (0.504/0.500, 0.594/0.594, 0.615/0.615,
+0.680/0.680 at k_mu 16/32/48/64), and 32x64/row matches 64x32/col the same way.
+The non-temporal hint then has nothing left to do in the good order (0.504
+either way, because the last-use loads are hits); it only partly rescues the
+bad one (0.625 -> 0.594).
+
+Reordering the loads INSIDE a k-step cannot do any of this: in a packed panel a
+line is touched exactly once per pass, so there is no intra-pass reuse to
+exploit.  The only reuse is across passes, and the pass order is what governs
+it.
+
+What caps k_mu is capacity, not aliasing: live ~= (m_t+n_t)*k_mu*esize + t*4
+KiB, so 32 KiB of L1 allows k_mu <= 21 at t=4 (768 B per k-step) and k_mu <= 48
+at t=2 (512 B).  The 4-tile's 0.680 at k_mu=64 is a 64 KiB live set, twice L1 --
+the simulator still finds the reuse, a real kernel would thrash.  The 2-tile
+32x32 holds 0.500 / 32 B/cy flat to k_mu=48 with no non-temporal loads at all,
+so the 4-tile buys only epilogue frequency (C touched once per 2048 doubles
+instead of 1024) and pays 8 KiB more AB for a live set that only fits k_mu<=21.
 
 Fully associative baseline [sim], load+store accumulator pattern, and (for
 the 32x64 row only) packdim = the nano shape -- see the MR/NR table below for
