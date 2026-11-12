@@ -660,6 +660,36 @@ nothing at 11.  What survives at every latency is the L2 read bandwidth
 (32 vs 48-50 B/cy) and the option value of 50 % instead of 81 % MSHR
 occupancy when the L2 latency varies with DRAM contention.
 
+Non-temporal strip loads (ldnt1d / ldnt1w)
+------------------------------------------
+A strip is dead after the last pass that uses it inside a chunk -- A(r) after
+the last column group, B(c) after the last row group -- so those loads can be
+non-temporal, while the earlier uses must allocate because a later pass in the
+same chunk reuses them.  That is the right discipline, and the simulation says
+where it pays [sim, 8-way, kc=192, 32x64 with packdim = MR/NR]:
+
+     k_mu   none: fills / L2 rd        last-use ldnt: fills / L2 rd
+      16      0.625     40.0 B/cy          0.594    38.0 B/cy
+      24      0.792     50.7                0.635    40.7
+      32      0.750     48.0                0.641    41.0
+
+and on 32x32 it is EXACTLY neutral (0.500 and 32 B/cy either way), because
+there the last-use load is already a hit and bypassing a hit changes nothing.
+
+So the predictor is whether that load was a miss: with residency holding there
+is nothing to gain; in the aliasing regime of the 4-tile layout it stops a
+miss from evicting the AB buffer, which recovers most of the k_mu sensitivity
+(0.792 -> 0.635 at k_mu=24) without reaching the 2-tile's floor.
+
+Marking ALL strip loads non-temporal is a large loss instead (0.500 -> 0.750 on
+32x32): the first use of every strip must stay cached, or the later pass
+re-fetches it.  `--ldnt last` and `--ldnt all` in the tool; `--ldnt-pol
+bypass|lru` chooses between not allocating and allocating as the first victim,
+and the two give identical numbers here, so the conclusion does not rest on the
+implementation's choice -- but a core that implements ldnt as "allocate
+normally, only mark it" would show no gain at all, which is worth a
+microbenchmark before relying on it.
+
 fp32 at SVL=512
 ---------------
 The nano tile doubles to 32x32 floats (still 4 KiB of ZA) and an FMOPA covers
